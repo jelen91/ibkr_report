@@ -24,11 +24,11 @@ export default function Instructions() {
             image: "/images/guide/5.png"
         },
         {
-            text: "V nastavení reportu vyberte v sekci Sections položky 'Net Asset Value' a 'Open Positions' (vybrat všechny sloupce Select All)",
+            text: "V nastavení reportu vyberte v sekci Sections položky 'Net Asset Value', 'Open Positions'. V Open Positions UJISTĚTE SE, že máte vybrané sloupce: 'Quantity', 'Mark Price', 'Value', 'Cost Basis Price', 'Total Unrealized PNL' (nejlépe Select All).",
             image: "/images/guide/6.png"
         },
         {
-            text: "Dole v nastavení zaškrtněte 'Include Currency Rates'",
+            text: "Dole v nastavení Models zvolte Optional a zaškrtněte 'Include Currency Rates'",
             image: "/images/guide/7.png"
         },
         {
