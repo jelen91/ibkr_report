@@ -101,7 +101,10 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                 case 'Blokováno':
                 case 'Blokováno $': return Number(p.commitedCapital || 0);
                 case 'Blokováno CZK': return Number(p.commitedCapital || 0) * (p.fxRateToBase || 1);
-                case 'Cost Basis': return Number(p.costPrice || 0);
+                case 'Blokováno CZK': return Number(p.commitedCapital || 0) * (p.fxRateToBase || 1);
+                case 'Avg Price': return Number(p.costBasisPrice || p.costPrice || 0);
+                case 'P/L': return Number(p.unrealizedPnL || p.fifoPnlUnrealized || 0);
+                case 'Cost Basis': return Number(p.costBasisPrice || p.costPrice || 0);
                 case '%':
                     const valForPercent = p.commitedCapital ? p.commitedCapital : p.marketValue;
                     const valInBase = Math.abs(valForPercent) * (p.fxRateToBase || 1);
@@ -197,6 +200,19 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                                         case 'Hodnota CZK':
                                             const valCZK = (p.marketValue || 0) * (p.fxRateToBase || 1);
                                             return <td key={col} style={{ padding: '8px', fontWeight: 'bold' }}>{valCZK.toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>;
+
+                                        case 'Avg Price':
+                                            const cost = p.costBasisPrice || p.costPrice;
+                                            return <td key={col} style={{ padding: '8px' }}>{cost ? Number(cost).toLocaleString() : '-'}</td>;
+
+                                        case 'P/L':
+                                            const pnl = Number(p.unrealizedPnL || p.fifoPnlUnrealized || 0);
+                                            const pnlColor = pnl > 0 ? '#4dff4d' : pnl < 0 ? '#ff4d4d' : '#888';
+                                            return (
+                                                <td key={col} style={{ padding: '8px', fontWeight: 'bold', color: pnlColor }}>
+                                                    {pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })} {p.currency}
+                                                </td>
+                                            );
 
                                         case 'Blokováno':
                                         case 'Blokováno $':

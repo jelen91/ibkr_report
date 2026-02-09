@@ -11,6 +11,10 @@ export interface PositionValue {
     fxRateToBase?: number;
     assetClass: 'STK' | 'OPT' | 'CRYPTO' | 'FUT' | string;
     costPrice?: number;
+    costBasisPrice?: number;
+    fifoPnlUnrealized?: number;
+    unrealizedPnL?: number;
+    costBasisMoney?: number;
 }
 
 export interface PositionItem {

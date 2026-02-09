@@ -193,7 +193,11 @@ export async function GET(request: NextRequest) {
                     strike: Number(pos.strike || 0),
                     type: pos.putCall === 'P' ? 'PUT' : (pos.putCall === 'C' ? 'CALL' : null),
                     commitedCapital: commitedCapital,
-                    costPrice: Number(pos.costBasisPrice || 0),
+                    costPrice: Number(pos.costBasisPrice || pos.costPrice || 0),
+                    costBasisPrice: Number(pos.costBasisPrice || 0),
+                    fifoPnlUnrealized: Number(pos.fifoPnlUnrealized || 0),
+                    unrealizedPnL: Number(pos.unrealizedPnL || 0),
+                    costBasisMoney: Number(pos.costBasisMoney || 0),
                     debugKeys: Object.keys(pos) // TEMPORARY DEBUG
                 },
                 currency: pos.currency

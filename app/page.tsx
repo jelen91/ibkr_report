@@ -284,7 +284,7 @@ export default function Dashboard() {
           <PositionTable
             title="Short Puts (Příjem)"
             data={options.filter(o => o.value.type === 'PUT' && o.value.quantity < 0)}
-            columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Cena', 'Hodnota $', 'Blokováno $', 'Blokováno CZK', '%']}
+            columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Blokováno $', 'Blokováno CZK', '%']}
             color="#e74c3c"
             netLiquidation={netLiquidation}
           />
@@ -293,8 +293,8 @@ export default function Dashboard() {
           <PositionTable
             title="Short Calls (Příjem)"
             data={options.filter(o => o.value.type === 'CALL' && o.value.quantity < 0)}
-            columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Cena', 'Hodnota $', 'Hodnota CZK', 'Blokováno', '%']}
-            color="#c0392b"
+            color="var(--danger-color)"
+            columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
           />
 
@@ -303,8 +303,8 @@ export default function Dashboard() {
           <PositionTable
             title="Long Puts (Zajištění)"
             data={options.filter(o => o.value.type === 'PUT' && o.value.quantity > 0)}
-            columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Cena', 'Hodnota $', 'Hodnota CZK', '%']}
-            color="#f39c12"
+            color="var(--option-color)"
+            columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
           />
 
@@ -312,8 +312,8 @@ export default function Dashboard() {
           <PositionTable
             title="Long Calls (Růst)"
             data={options.filter(o => o.value.type === 'CALL' && o.value.quantity > 0)}
-            columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Cena', 'Hodnota $', 'Hodnota CZK', '%']}
-            color="#2ecc71"
+            color="var(--option-color)"
+            columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
           />
 
@@ -321,8 +321,8 @@ export default function Dashboard() {
           <PositionTable
             title="Akcie"
             data={stocks}
-            columns={['Ticker', 'Ks', 'Cena', 'Hodnota $', 'Hodnota CZK', '%']}
-            color="#27ae60"
+            color="var(--primary-color)"
+            columns={['Ticker', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
           />
 
@@ -330,8 +330,8 @@ export default function Dashboard() {
           <PositionTable
             title="Krypto"
             data={cryptos}
-            columns={['Ticker', 'Ks', 'Cena', 'Hodnota $', 'Hodnota CZK', '%']}
-            color="#f1c40f"
+            color="var(--primary-color)"
+            columns={['Ticker', 'Asset', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
           />
 
@@ -339,8 +339,8 @@ export default function Dashboard() {
           <PositionTable
             title="Futures"
             data={futures}
-            columns={['Ticker', 'Expirace', 'Ks', 'Cena', 'Hodnota $', 'Hodnota CZK', '%']}
-            color="#9b59b6"
+            color="var(--futures-color)"
+            columns={['Ticker', 'Expirace', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Blokováno $', 'Blokováno CZK', '%']}
             netLiquidation={netLiquidation}
           />
         </div>
@@ -348,5 +348,3 @@ export default function Dashboard() {
     </div>
   );
 }
-
-
