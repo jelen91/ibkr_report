@@ -104,118 +104,116 @@ export async function GET(request: NextRequest) {
         }
 
 
-        // 3. Process Data
-        const statements = reportData.FlexStatements?.FlexStatement;
-
-        const stmt = Array.isArray(statements) ? statements[0] : statements;
-
-        if (!stmt) {
+        // 3. Process Data — handle single OR multiple FlexStatements (multi-account)
+        const statementsRaw = reportData.FlexStatements?.FlexStatement;
+        if (!statementsRaw) {
             console.error("Statement is empty or undefined. ReportData dump:", JSON.stringify(reportData, null, 2));
             return NextResponse.json({ error: "Empty statement in report" }, { status: 500 });
         }
+        const stmtList: any[] = Array.isArray(statementsRaw) ? statementsRaw : [statementsRaw];
+        console.log(`Processing ${stmtList.length} FlexStatement(s)`);
 
-        // Extract Summary
-        const summary = [];
-        // Correct path based on logs: stmt.EquitySummaryInBase -> EquitySummaryByReportDateInBase
-        const equitySummaryRoot = stmt.EquitySummaryInBase;
-        const equitySummary = equitySummaryRoot?.EquitySummaryByReportDateInBase;
+        // Accumulators for equity metrics (we sum across all accounts)
+        let totalCash = 0;
+        let totalNetLiq = 0;
+        let totalStock = 0;
+        let totalOptionsShort = 0;
+        let latestReportDate: string | null = null;
+        let baseCurrency = stmtList[0]?.currency || 'CZK';
+        let eurToCzkRate: number | null = null;
 
-        if (equitySummary) {
-            // Fix: Sort by reportDate descending to get the latest
-            const eqArray = Array.isArray(equitySummary) ? equitySummary : [equitySummary];
-            eqArray.sort((a: any, b: any) => Number(b.reportDate) - Number(a.reportDate));
-            eqArray.sort((a: any, b: any) => Number(b.reportDate) - Number(a.reportDate));
-            const eq = eqArray[0];
+        const positions: any[] = [];
 
-            // Map fields based on User's XML format (cash, total, stockLong, optionsShort)
-            // Fallback to standard names just in case
+        for (const stmt of stmtList) {
+            // --- Equity Summary ---
+            const equitySummaryRoot = stmt.EquitySummaryInBase;
+            const equitySummary = equitySummaryRoot?.EquitySummaryByReportDateInBase;
 
-            // AvailableFunds (Cash)
-            const cash = eq.cash ?? eq.cashBalance;
-            if (cash !== undefined) summary.push({ tag: 'AvailableFunds', value: Number(cash), currency: stmt.currency });
+            if (equitySummary) {
+                const eqArray: any[] = Array.isArray(equitySummary) ? equitySummary : [equitySummary];
+                // Take the most recent reportDate for this statement
+                eqArray.sort((a: any, b: any) => Number(b.reportDate) - Number(a.reportDate));
+                const eq = eqArray[0];
 
-            // NetLiquidation (Total NAV)
-            const netLiq = eq.total ?? eq.totalNav;
-            if (netLiq !== undefined) summary.push({ tag: 'NetLiquidation', value: Number(netLiq), currency: stmt.currency });
+                totalCash += Number(eq.cash ?? eq.cashBalance ?? 0);
+                totalNetLiq += Number(eq.total ?? eq.totalNav ?? 0);
+                totalStock += Number(eq.stockLong ?? eq.stock ?? eq.stockMarketValue ?? 0);
+                totalOptionsShort += Number(eq.optionsShort ?? eq.options ?? eq.optionMarketValue ?? 0);
 
-            // Stock Value (Long)
-            const stock = eq.stockLong ?? eq.stock ?? eq.stockMarketValue;
-            if (stock !== undefined) summary.push({ tag: 'StockValueLong', value: Number(stock), currency: stmt.currency });
-
-            // Option Value (Short)
-            const options = eq.optionsShort ?? eq.options ?? eq.optionMarketValue;
-            if (options !== undefined) summary.push({ tag: 'OptionValueShort', value: Number(options), currency: stmt.currency });
-
-            // InitMarginReq (Not present in user XML, keep optional)
-            if (eq.initMarginReq !== undefined) summary.push({ tag: 'InitMarginReq', value: Number(eq.initMarginReq), currency: stmt.currency });
-
-            // Report Date
-            if (eq.reportDate) {
-                summary.push({ tag: 'ReportDate', value: formatDate(String(eq.reportDate)) });
+                if (eq.reportDate) {
+                    const formatted = formatDate(String(eq.reportDate));
+                    if (!latestReportDate || String(eq.reportDate) > latestReportDate) {
+                        latestReportDate = formatted;
+                    }
+                }
+            } else {
+                console.log(`EquitySummary missing for account ${stmt.accountId}`);
             }
 
-        } else {
-            console.log("EquitySummary details missing. Root Keys:", equitySummaryRoot ? Object.keys(equitySummaryRoot) : "Root undefined");
-        }
+            // --- Positions ---
+            const openPositions = stmt.OpenPositions?.OpenPosition;
+            const positionsList: any[] = Array.isArray(openPositions)
+                ? openPositions
+                : (openPositions ? [openPositions] : []);
 
-        // Extract Positions
-        const positions = [];
-        const openPositionsRoot = stmt.OpenPositions;
-        // Try common variations
-        let openPositions = openPositionsRoot?.OpenPosition;
+            for (const pos of positionsList) {
+                if (pos.levelOfDetail && pos.levelOfDetail.toUpperCase() !== 'SUMMARY') continue;
 
-        const positionsList = Array.isArray(openPositions) ? openPositions : (openPositions ? [openPositions] : []);
+                const quantity = Number(pos.position || 0);
+                const marketValue = Number(pos.positionValue || 0);
 
-        for (const [index, pos] of positionsList.entries()) {
-            if (pos.levelOfDetail && pos.levelOfDetail.toUpperCase() !== 'SUMMARY') continue;
+                let commitedCapital = 0;
+                if (pos.assetCategory === 'OPT' && quantity < 0 && pos.putCall === 'P') {
+                    commitedCapital = Number(pos.strike) * Number(pos.multiplier) * quantity;
+                }
 
-            let marketValue = Number(pos.positionValue || 0);
-            const quantity = Number(pos.position || 0);
-
-            // Blocked Capital Calculation for Short Puts
-            let commitedCapital = 0;
-            if (pos.assetCategory === 'OPT' && quantity < 0 && pos.putCall === 'P') {
-                commitedCapital = Number(pos.strike) * Number(pos.multiplier) * quantity;
+                positions.push({
+                    tag: 'Position',
+                    value: {
+                        symbol: pos.symbol,
+                        underlying: pos.underlyingSymbol,
+                        quantity,
+                        markPrice: Number(pos.markPrice || 0),
+                        marketValue,
+                        assetClass: pos.assetCategory,
+                        fxRateToBase: Number(pos.fxRateToBase || 1),
+                        multiplier: Number(pos.multiplier || 1),
+                        expiry: pos.expiry ? formatDate(pos.expiry) : null,
+                        strike: Number(pos.strike || 0),
+                        type: pos.putCall === 'P' ? 'PUT' : (pos.putCall === 'C' ? 'CALL' : null),
+                        commitedCapital,
+                        costPrice: Number(pos.costBasisPrice || pos.costPrice || 0),
+                        costBasisPrice: Number(pos.costBasisPrice || 0),
+                        fifoPnlUnrealized: Number(pos.fifoPnlUnrealized || 0),
+                        unrealizedPnL: Number(pos.unrealizedPnL || 0),
+                        costBasisMoney: Number(pos.costBasisMoney || 0),
+                    },
+                    currency: pos.currency
+                });
             }
 
-            positions.push({
-                tag: 'Position',
-                value: {
-                    symbol: pos.symbol,
-                    underlying: pos.underlyingSymbol,
-                    quantity: quantity,
-                    markPrice: Number(pos.markPrice || 0),
-                    marketValue: marketValue,
-                    assetClass: pos.assetCategory,
-                    fxRateToBase: Number(pos.fxRateToBase || 1),
-                    multiplier: Number(pos.multiplier || 1),
-                    expiry: pos.expiry ? formatDate(pos.expiry) : null,
-                    strike: Number(pos.strike || 0),
-                    type: pos.putCall === 'P' ? 'PUT' : (pos.putCall === 'C' ? 'CALL' : null),
-                    commitedCapital: commitedCapital,
-                    costPrice: Number(pos.costBasisPrice || pos.costPrice || 0),
-                    costBasisPrice: Number(pos.costBasisPrice || 0),
-                    fifoPnlUnrealized: Number(pos.fifoPnlUnrealized || 0),
-                    unrealizedPnL: Number(pos.unrealizedPnL || 0),
-                    costBasisMoney: Number(pos.costBasisMoney || 0),
-                    debugKeys: Object.keys(pos) // TEMPORARY DEBUG
-                },
-                currency: pos.currency
-            });
-        }
-
-        // Extract EUR→CZK conversion rate from ConversionRates block
-        const conversionRatesRoot = stmt.ConversionRates;
-        const conversionRatesList = conversionRatesRoot?.ConversionRate;
-        if (conversionRatesList) {
-            const rateArray = Array.isArray(conversionRatesList) ? conversionRatesList : [conversionRatesList];
-            const eurRate = rateArray.find((r: any) => r.fromCurrency === 'EUR' && r.toCurrency === 'CZK');
-            if (eurRate) {
-                summary.push({ tag: 'EurToCzkRate', value: Number(eurRate.rate) });
+            // --- EUR/CZK rate (take from first statement that has it) ---
+            if (eurToCzkRate === null) {
+                const ratesList = stmt.ConversionRates?.ConversionRate;
+                if (ratesList) {
+                    const ratesArray: any[] = Array.isArray(ratesList) ? ratesList : [ratesList];
+                    const eurRate = ratesArray.find((r: any) => r.fromCurrency === 'EUR' && r.toCurrency === 'CZK');
+                    if (eurRate) eurToCzkRate = Number(eurRate.rate);
+                }
             }
         }
+
+        // Build summary array from accumulated values
+        const summary: any[] = [];
+        summary.push({ tag: 'AvailableFunds', value: totalCash, currency: baseCurrency });
+        summary.push({ tag: 'NetLiquidation', value: totalNetLiq, currency: baseCurrency });
+        summary.push({ tag: 'StockValueLong', value: totalStock, currency: baseCurrency });
+        summary.push({ tag: 'OptionValueShort', value: totalOptionsShort, currency: baseCurrency });
+        if (latestReportDate) summary.push({ tag: 'ReportDate', value: latestReportDate });
+        if (eurToCzkRate !== null) summary.push({ tag: 'EurToCzkRate', value: eurToCzkRate });
 
         return NextResponse.json([...summary, ...positions]);
+
 
     } catch (error) {
         console.error("API Error:", error);
