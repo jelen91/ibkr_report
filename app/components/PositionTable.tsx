@@ -6,12 +6,27 @@ interface PositionCategoryProps {
     columns: string[];
     color: string;
     netLiquidation: number;
+    currency: 'CZK' | 'EUR';
+    eurToCzkRate: number;
 }
 
-export default function PositionCategory({ title, data, columns, color, netLiquidation }: PositionCategoryProps) {
+export default function PositionCategory({ title, data, columns, color, netLiquidation, currency, eurToCzkRate }: PositionCategoryProps) {
     const [sortConfig, setSortConfig] = useState<{ key: string, direction: 'asc' | 'desc' } | null>(null);
 
     if (!data || data.length === 0) return null;
+
+    // Convert CZK value to display currency
+    const toDisplay = (czk: number) => currency === 'EUR' ? czk / eurToCzkRate : czk;
+
+    // Dynamic label for base-currency columns
+    const baseLabel = currency; // 'CZK' or 'EUR'
+
+    // Dynamic column header label
+    const colLabel = (col: string) => {
+        if (col === 'Hodnota CZK') return `Hodnota ${baseLabel}`;
+        if (col === 'Blokováno CZK') return `Blokováno ${baseLabel}`;
+        return col;
+    };
 
     const requestSort = (key: string) => {
         let direction: 'asc' | 'desc' = 'asc';
@@ -24,39 +39,35 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
     const getExpiryStyle = (expiry: string | number | undefined) => {
         if (!expiry) return {};
         let s = String(expiry);
-        let diffDays = 0;
 
         let targetDate: Date | null = null;
 
         if (s.includes('.')) {
-            // DD.MM.YYYY
             targetDate = new Date(s.split('.').reverse().join('-'));
         } else if (s.length === 8) {
-            // YYYYMMDD
             targetDate = new Date(`${s.substring(0, 4)}-${s.substring(4, 6)}-${s.substring(6, 8)}`);
         }
 
+        let diffDays = 0;
         if (targetDate) {
             const today = new Date();
             const diffTime = targetDate.getTime() - today.getTime();
             diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
         }
 
-
-        // Logic: Green -> Yellow -> Red
         let bgColor;
         let textColor = '#fff';
 
         if (diffDays <= 7) {
-            bgColor = '#ff4d4d'; // Red
+            bgColor = '#ff4d4d';
         } else if (diffDays <= 30) {
-            bgColor = '#ffad33'; // Orange
+            bgColor = '#ffad33';
             textColor = '#000';
         } else if (diffDays <= 60) {
-            bgColor = '#ffff66'; // Yellow
+            bgColor = '#ffff66';
             textColor = '#000';
         } else {
-            bgColor = '#4dff4d'; // Green
+            bgColor = '#4dff4d';
             textColor = '#000';
         }
 
@@ -76,7 +87,7 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
             return `${s.substring(6, 8)}.${s.substring(4, 6)}.${s.substring(0, 4)}`;
         }
         return s;
-    }
+    };
 
     const sortedData = [...data].sort((a, b) => {
         if (!sortConfig) return 0;
@@ -87,8 +98,7 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                 case 'Ticker': return p.underlying || p.symbol;
                 case 'Expirace':
                     const s = String(p.expiry || '');
-                    if (!s) return '99999999'; // Sort undefined/null to end
-                    // Normalize to YYYYMMDD for sorting
+                    if (!s) return '99999999';
                     if (s.includes('.')) return s.split('.').reverse().join('');
                     return s;
                 case 'Strike': return Number(p.strike || 0);
@@ -100,7 +110,6 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                 case 'Hodnota CZK': return Number(p.marketValue || 0) * (p.fxRateToBase || 1);
                 case 'Blokováno':
                 case 'Blokováno $': return Number(p.commitedCapital || 0);
-                case 'Blokováno CZK': return Number(p.commitedCapital || 0) * (p.fxRateToBase || 1);
                 case 'Blokováno CZK': return Number(p.commitedCapital || 0) * (p.fxRateToBase || 1);
                 case 'Avg Price': return Number(p.costBasisPrice || p.costPrice || 0);
                 case 'P/L': return Number(p.unrealizedPnL || p.fifoPnlUnrealized || 0);
@@ -114,7 +123,7 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
         };
 
         const valA = getValue(a, sortConfig.key);
-        const valB = getValue(b, sortConfig.key); // Fix variable name
+        const valB = getValue(b, sortConfig.key);
 
         if (valA < valB) return sortConfig.direction === 'asc' ? -1 : 1;
         if (valA > valB) return sortConfig.direction === 'asc' ? 1 : -1;
@@ -133,7 +142,7 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                                 style={{ padding: '8px', cursor: 'pointer', userSelect: 'none' }}
                                 onClick={() => requestSort(c)}
                             >
-                                {c} {sortConfig?.key === c ? (sortConfig.direction === 'asc' ? '▲' : '▼') : ''}
+                                {colLabel(c)} {sortConfig?.key === c ? (sortConfig.direction === 'asc' ? '▲' : '▼') : ''}
                             </th>
                         ))}
                     </tr>
@@ -141,12 +150,8 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                 <tbody>
                     {sortedData.map((item, idx) => {
                         const p = item.value;
-                        // Calculate % for "Hodnota" (Commited Capital) or "Value" (Market Value) depending on context
                         const valForPercent = p.commitedCapital ? p.commitedCapital : p.marketValue;
-
-                        // Convert to Base Currency using FX Rate (if available)
                         const valInBase = Math.abs(valForPercent) * (p.fxRateToBase || 1);
-
                         const percent = netLiquidation ? (valInBase / netLiquidation * 100).toFixed(2) : '0.00';
 
                         return (
@@ -197,15 +202,18 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                                         case 'Hodnota $':
                                             return <td key={col} style={{ padding: '8px', fontWeight: 'bold' }}>{Number(p.marketValue || 0).toLocaleString()}</td>;
 
-                                        case 'Hodnota CZK':
+                                        case 'Hodnota CZK': {
                                             const valCZK = (p.marketValue || 0) * (p.fxRateToBase || 1);
-                                            return <td key={col} style={{ padding: '8px', fontWeight: 'bold' }}>{valCZK.toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>;
+                                            const displayed = toDisplay(valCZK);
+                                            return <td key={col} style={{ padding: '8px', fontWeight: 'bold' }}>{displayed.toLocaleString(undefined, { maximumFractionDigits: 0 })}</td>;
+                                        }
 
-                                        case 'Avg Price':
+                                        case 'Avg Price': {
                                             const cost = p.costBasisPrice || p.costPrice;
                                             return <td key={col} style={{ padding: '8px' }}>{cost ? Number(cost).toLocaleString() : '-'}</td>;
+                                        }
 
-                                        case 'P/L':
+                                        case 'P/L': {
                                             const pnl = Number(p.unrealizedPnL || p.fifoPnlUnrealized || 0);
                                             const pnlColor = pnl > 0 ? '#4dff4d' : pnl < 0 ? '#ff4d4d' : '#888';
                                             return (
@@ -213,6 +221,7 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                                                     {pnl.toLocaleString(undefined, { maximumFractionDigits: 2 })} {p.currency}
                                                 </td>
                                             );
+                                        }
 
                                         case 'Blokováno':
                                         case 'Blokováno $':
@@ -222,13 +231,15 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                                                 </td>
                                             );
 
-                                        case 'Blokováno CZK':
+                                        case 'Blokováno CZK': {
                                             const blockedCZK = (p.commitedCapital || 0) * (p.fxRateToBase || 1);
+                                            const displayed = toDisplay(blockedCZK);
                                             return (
                                                 <td key={col} style={{ padding: '8px', fontFamily: 'monospace', color: '#ccc', fontWeight: 'bold' }}>
-                                                    {p.commitedCapital ? blockedCZK.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '-'}
+                                                    {p.commitedCapital ? displayed.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '-'}
                                                 </td>
                                             );
+                                        }
 
                                         case 'Cost Basis':
                                             return <td key={col} style={{ padding: '8px' }}>{Number(p.costPrice || 0).toFixed(2)}</td>;

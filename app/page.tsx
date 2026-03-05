@@ -13,6 +13,7 @@ export default function Dashboard() {
   const [status, setStatus] = useState({ connected: false });
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [currency, setCurrency] = useState<'CZK' | 'EUR'>('CZK');
 
   // User Credentials State
   const [flexToken, setFlexToken] = useState<string>('');
@@ -163,6 +164,13 @@ export default function Dashboard() {
 
   const netLiquidation = Number(getMetricValue('NetLiquidation'));
   const availableFunds = Number(getMetricValue('AvailableFunds'));
+  const eurToCzkRate = Number(getMetricValue('EurToCzkRate')) || 24.375; // fallback
+
+  // Helper: convert CZK value to display currency
+  const toDisplay = (czk: number) => currency === 'EUR' ? czk / eurToCzkRate : czk;
+  const formatDisplay = (czk: number) =>
+    toDisplay(czk).toLocaleString('cs-CZ', { maximumFractionDigits: 0 }) + ' ' + currency;
+
   // Calculate Stock Value dynamically from positions (to support mock edits)
   const stockValueLong = stocks.reduce((sum, item) => sum + ((item.value.marketValue || 0) * (item.value.fxRateToBase || 1)), 0);
   const cryptoValue = cryptos.reduce((sum, item) => sum + ((item.value.marketValue || 0) * (item.value.fxRateToBase || 1)), 0);
@@ -178,7 +186,6 @@ export default function Dashboard() {
   const totalCommitedCapital = options.reduce((sum, item) => sum + ((item.value.commitedCapital || 0) * (item.value.fxRateToBase || 1)), 0);
 
   // Calculate Long Option Value (Market Value converted to Base)
-  // Include both CALLs and PUTs (Long)
   const longOptionValue = options
     .filter(o => (o.value.type === 'CALL' || o.value.type === 'PUT') && o.value.quantity > 0)
     .reduce((sum, item) => sum + ((item.value.marketValue || 0) * (item.value.fxRateToBase || 1)), 0);
@@ -187,7 +194,6 @@ export default function Dashboard() {
   const allocatedAlloc = netLiquidation ? (totalAllocated / netLiquidation * 100).toFixed(1) : '0';
 
   // Derived Cash for Pie Chart (Net Liq - Invested)
-  // If we are leveraged (>100%), cash slice is 0.
   const derivedCash = Math.max(0, netLiquidation - totalAllocated);
 
   const reportDate = getReportDate();
@@ -195,7 +201,7 @@ export default function Dashboard() {
   return (
     <div className="app">
       <header className="dashboard-header">
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', width: '100%', flexWrap: 'wrap', rowGap: '0.5rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
             <h1>IBKR Přehled Portfolia</h1>
             <div className={`status-badge ${status.connected ? 'connected' : 'disconnected'}`}>
@@ -206,6 +212,53 @@ export default function Dashboard() {
           {status.connected && (
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
               {reportDate && <div className="report-date">Data: {reportDate}</div>}
+
+              {/* Currency Toggle – sliding pill */}
+              <div
+                onClick={() => setCurrency(c => c === 'CZK' ? 'EUR' : 'CZK')}
+                style={{
+                  position: 'relative',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  width: '88px',
+                  height: '30px',
+                  borderRadius: '999px',
+                  background: '#1e293b',
+                  border: '1px solid #334155',
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                  boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.4)',
+                }}
+              >
+                {/* sliding pill */}
+                <span style={{
+                  position: 'absolute',
+                  left: currency === 'CZK' ? '3px' : 'calc(50% + 1px)',
+                  width: 'calc(50% - 4px)',
+                  height: '22px',
+                  borderRadius: '999px',
+                  background: 'linear-gradient(135deg, #3b82f6, #6366f1)',
+                  boxShadow: '0 2px 8px rgba(99,102,241,0.5)',
+                  transition: 'left 0.22s cubic-bezier(0.4,0,0.2,1)',
+                }} />
+                {/* labels */}
+                {(['CZK', 'EUR'] as const).map(cur => (
+                  <span key={cur} style={{
+                    position: 'relative',
+                    flex: 1,
+                    textAlign: 'center',
+                    fontSize: '0.72rem',
+                    fontWeight: 700,
+                    letterSpacing: '0.03em',
+                    color: currency === cur ? '#fff' : '#64748b',
+                    transition: 'color 0.22s',
+                    zIndex: 1,
+                  }}>
+                    {cur}
+                  </span>
+                ))}
+              </div>
+
               <button
                 onClick={handleDisconnect}
                 style={{
@@ -246,13 +299,13 @@ export default function Dashboard() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', justifyContent: 'space-between' }}>
               <div className="card summary-card">
                 <h3>Čistá Likvidace</h3>
-                <div className="value">{Number(netLiquidation).toLocaleString('cs-CZ')} CZK</div>
+                <div className="value">{formatDisplay(netLiquidation)}</div>
                 <div className="subtext">Celková hodnota účtu</div>
               </div>
 
               <div className="card summary-card">
                 <h3>Investovaný Kapitál</h3>
-                <div className="value">{Number(totalAllocated).toLocaleString('cs-CZ')} CZK</div>
+                <div className="value">{formatDisplay(totalAllocated)}</div>
                 <div className="subtext">Aktiva + Blokované opce ({allocatedAlloc}%)</div>
               </div>
 
@@ -271,6 +324,8 @@ export default function Dashboard() {
               longOptionValue={longOptionValue}
               freeCash={derivedCash}
               total={netLiquidation}
+              currency={currency}
+              eurToCzkRate={eurToCzkRate}
             />
           </div>
         </>
@@ -287,6 +342,8 @@ export default function Dashboard() {
             columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Blokováno $', 'Blokováno CZK', '%']}
             color="#e74c3c"
             netLiquidation={netLiquidation}
+            currency={currency}
+            eurToCzkRate={eurToCzkRate}
           />
 
           {/* 2. Short Calls (Covered/Income) - Red */}
@@ -296,8 +353,9 @@ export default function Dashboard() {
             color="var(--danger-color)"
             columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
+            currency={currency}
+            eurToCzkRate={eurToCzkRate}
           />
-
 
           {/* 3. Long Puts (Hedge) - Orange */}
           <PositionTable
@@ -306,6 +364,8 @@ export default function Dashboard() {
             color="var(--option-color)"
             columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
+            currency={currency}
+            eurToCzkRate={eurToCzkRate}
           />
 
           {/* 4. Long Calls (Growth) - Green */}
@@ -315,6 +375,8 @@ export default function Dashboard() {
             color="var(--option-color)"
             columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
+            currency={currency}
+            eurToCzkRate={eurToCzkRate}
           />
 
           {/* 5. Stocks - Green */}
@@ -324,6 +386,8 @@ export default function Dashboard() {
             color="var(--primary-color)"
             columns={['Ticker', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
+            currency={currency}
+            eurToCzkRate={eurToCzkRate}
           />
 
           {/* 6. Crypto - Gold */}
@@ -333,6 +397,8 @@ export default function Dashboard() {
             color="var(--primary-color)"
             columns={['Ticker', 'Asset', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
             netLiquidation={netLiquidation}
+            currency={currency}
+            eurToCzkRate={eurToCzkRate}
           />
 
           {/* 7. Futures - Purple */}
@@ -342,6 +408,8 @@ export default function Dashboard() {
             color="var(--futures-color)"
             columns={['Ticker', 'Expirace', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Blokováno $', 'Blokováno CZK', '%']}
             netLiquidation={netLiquidation}
+            currency={currency}
+            eurToCzkRate={eurToCzkRate}
           />
         </div>
       )}

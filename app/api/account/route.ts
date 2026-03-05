@@ -204,6 +204,17 @@ export async function GET(request: NextRequest) {
             });
         }
 
+        // Extract EUR→CZK conversion rate from ConversionRates block
+        const conversionRatesRoot = stmt.ConversionRates;
+        const conversionRatesList = conversionRatesRoot?.ConversionRate;
+        if (conversionRatesList) {
+            const rateArray = Array.isArray(conversionRatesList) ? conversionRatesList : [conversionRatesList];
+            const eurRate = rateArray.find((r: any) => r.fromCurrency === 'EUR' && r.toCurrency === 'CZK');
+            if (eurRate) {
+                summary.push({ tag: 'EurToCzkRate', value: Number(eurRate.rate) });
+            }
+        }
+
         return NextResponse.json([...summary, ...positions]);
 
     } catch (error) {
