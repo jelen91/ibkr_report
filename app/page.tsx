@@ -15,6 +15,12 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(false);
   const [currency, setCurrency] = useState<'CZK' | 'EUR'>('CZK');
 
+  // Load currency preference from localStorage
+  useEffect(() => {
+    const saved = localStorage.getItem('ibkr_currency');
+    if (saved === 'EUR' || saved === 'CZK') setCurrency(saved);
+  }, []);
+
   // User Credentials State
   const [flexToken, setFlexToken] = useState<string>('');
   const [flexQueryId, setFlexQueryId] = useState<string>('');
@@ -215,7 +221,11 @@ export default function Dashboard() {
 
               {/* Currency Toggle – sliding pill */}
               <div
-                onClick={() => setCurrency(c => c === 'CZK' ? 'EUR' : 'CZK')}
+                onClick={() => setCurrency(c => {
+                  const next = c === 'CZK' ? 'EUR' : 'CZK';
+                  localStorage.setItem('ibkr_currency', next);
+                  return next;
+                })}
                 style={{
                   position: 'relative',
                   display: 'inline-flex',
