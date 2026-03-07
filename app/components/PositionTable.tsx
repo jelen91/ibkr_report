@@ -127,8 +127,34 @@ export default function PositionCategory({ title, data, columns, color, netLiqui
                             <tr key={idx} style={{ borderBottom: '1px solid #222' }}>
                                 {columns.map(col => {
                                     switch (col) {
+                                        case 'Účet': {
+                                            const acctName = (p as any).accountName || '—';
+                                            const palette = [
+                                                { bg: '#1e3a5f', color: '#93c5fd' }, // blue
+                                                { bg: '#3a2610', color: '#fdba74' }, // orange
+                                                { bg: '#1a3a2a', color: '#6ee7b7' }, // green
+                                                { bg: '#3a2f0a', color: '#fde68a' }, // yellow
+                                                { bg: '#2d1b4e', color: '#c4b5fd' }, // purple
+                                                { bg: '#1f3a39', color: '#67e8f9' }, // cyan
+                                            ];
+                                            const hash = [...acctName].reduce((h, c) => h + c.charCodeAt(0), 0);
+                                            const { bg, color } = palette[hash % palette.length];
+                                            return (
+                                                <td key={col} style={{ padding: '8px' }}>
+                                                    <span style={{
+                                                        padding: '2px 8px', borderRadius: '4px',
+                                                        background: bg, color,
+                                                        fontSize: '0.75rem', fontWeight: 600, whiteSpace: 'nowrap',
+                                                    }}>
+                                                        {acctName}
+                                                    </span>
+                                                </td>
+                                            );
+                                        }
+
                                         case 'Ticker':
                                             return <td key={col} style={{ padding: '8px', fontWeight: 'bold' }}>{p.underlying || p.symbol}</td>;
+
 
                                         case 'Expirace':
                                             return (

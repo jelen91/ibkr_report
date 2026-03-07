@@ -10,16 +10,18 @@ import { AccountData, PositionItem, Account } from './types';
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-function mergeAccountDatas(datasets: AccountData[]): AccountData {
+function mergeAccountDatas(datasets: { data: AccountData; name: string }[]): AccountData {
   const result: AccountData = [];
   let netLiq = 0, cash = 0, stockLong = 0, optShort = 0;
   let reportDate: string | null = null;
   let baseCurrency = 'CZK';
 
-  for (const data of datasets) {
+  for (const { data, name } of datasets) {
     for (const item of data) {
       if (item.tag === 'Position') {
-        result.push(item);
+        // Annotate with account name for the Účet column
+        const annotated = { ...item, value: { ...(item as any).value, accountName: name } };
+        result.push(annotated);
       } else if (item.tag === 'NetLiquidation') {
         netLiq += Number(item.value);
       } else if (item.tag === 'AvailableFunds') {
@@ -135,14 +137,19 @@ export default function Dashboard() {
   }
 
   // ── active data ──
-  const loadedData = accounts.map(a => dataCache[a.id]).filter(Boolean) as AccountData[];
+  const loadedPairs = accounts
+    .map(a => dataCache[a.id] ? { data: dataCache[a.id], name: a.name } : null)
+    .filter(Boolean) as { data: AccountData; name: string }[];
+
   const activeData: AccountData | null = (() => {
     if (accounts.length === 0) return null;
     if (activeId === 'all') {
-      return loadedData.length > 0 ? mergeAccountDatas(loadedData) : null;
+      return loadedPairs.length > 0 ? mergeAccountDatas(loadedPairs) : null;
     }
     return dataCache[activeId] ?? null;
   })();
+
+  const showAccountCol = activeId === 'all' && accounts.length > 1;
 
   const isLoading = activeId === 'all'
     ? loadingIds.size > 0
@@ -385,37 +392,37 @@ export default function Dashboard() {
 
             <PositionTable title="Short Puts (Příjem)"
               data={options.filter(o => o.value.type === 'PUT' && o.value.quantity < 0)}
-              columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Blokováno $', 'Blokováno CZK', '%']}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Blokováno $', 'Blokováno CZK', '%']}
               color="#e74c3c" {...tableProps} />
 
             <PositionTable title="Short Calls (Příjem)"
               data={options.filter(o => o.value.type === 'CALL' && o.value.quantity < 0)}
-              columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
               color="var(--danger-color)" {...tableProps} />
 
             <PositionTable title="Long Puts (Zajištění)"
               data={options.filter(o => o.value.type === 'PUT' && o.value.quantity > 0)}
-              columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
               color="var(--option-color)" {...tableProps} />
 
             <PositionTable title="Long Calls (Růst)"
               data={options.filter(o => o.value.type === 'CALL' && o.value.quantity > 0)}
-              columns={['Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Expirace', 'Strike', 'Typ', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
               color="var(--option-color)" {...tableProps} />
 
             <PositionTable title="Akcie"
               data={stocks}
-              columns={['Ticker', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
               color="var(--primary-color)" {...tableProps} />
 
             <PositionTable title="Krypto"
               data={cryptos}
-              columns={['Ticker', 'Asset', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Asset', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
               color="var(--primary-color)" {...tableProps} />
 
             <PositionTable title="Futures"
               data={futures}
-              columns={['Ticker', 'Expirace', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Blokováno $', 'Blokováno CZK', '%']}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Expirace', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Blokováno $', 'Blokováno CZK', '%']}
               color="var(--futures-color)" {...tableProps} />
           </div>
         </>
