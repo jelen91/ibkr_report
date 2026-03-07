@@ -1,100 +1,107 @@
 import { useState } from 'react';
 
 interface CredentialsFormProps {
-    onConnect: (token: string, queryId: string, remember: boolean) => void;
+    onConnect: (name: string, token: string, queryId: string) => void;
     loading?: boolean;
+    compact?: boolean;
 }
 
-export default function CredentialsForm({ onConnect, loading }: CredentialsFormProps) {
+export default function CredentialsForm({ onConnect, loading, compact }: CredentialsFormProps) {
+    const [name, setName] = useState('');
     const [token, setToken] = useState('');
     const [queryId, setQueryId] = useState('');
-    const [remember, setRemember] = useState(false);
-
-    // If already saved in localStorage, these will be populated by parent or we could check here.
-    // But let's keep it simple: input fields.
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
         if (token && queryId) {
-            onConnect(token, queryId, remember);
+            onConnect(name || 'Účet', token, queryId);
         }
     };
 
-    return (
-        <div className="card" style={{ maxWidth: '600px', margin: '2rem auto' }}>
-            <h3>Připojení k IBKR Flex</h3>
-            <p style={{ fontSize: '0.9rem', opacity: 0.8, marginBottom: '1.5rem' }}>
-                Zadejte svůj Flex Token a Query ID pro zobrazení portfolia.
-            </p>
+    const inputStyle: React.CSSProperties = {
+        width: '100%',
+        padding: '0.6rem',
+        borderRadius: '4px',
+        border: '1px solid #444',
+        background: '#222',
+        color: '#fff',
+        boxSizing: 'border-box',
+        fontSize: '0.9rem',
+    };
 
-            <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                <div>
-                    <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.9rem' }}>Flex Token</label>
+    const labelStyle: React.CSSProperties = {
+        display: 'block',
+        marginBottom: '0.3rem',
+        fontSize: '0.8rem',
+        opacity: 0.7,
+    };
+
+    return (
+        <div className={compact ? undefined : 'card'} style={compact ? { background: '#0f172a', border: '1px solid #334155', borderRadius: '10px', padding: '1rem' } : { maxWidth: '600px', margin: '2rem auto' }}>
+            {!compact && (
+                <>
+                    <h3>Připojení k IBKR Flex</h3>
+                    <p style={{ fontSize: '0.9rem', opacity: 0.8, marginBottom: '1.5rem' }}>
+                        Zadejte Flex Token a Query ID pro zobrazení portfolia.
+                    </p>
+                </>
+            )}
+            {compact && <div style={{ fontSize: '0.85rem', fontWeight: 600, marginBottom: '0.75rem', color: '#94a3b8' }}>Přidat účet</div>}
+
+            <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: compact ? 'row' : 'column', gap: '0.6rem', flexWrap: 'wrap', alignItems: compact ? 'flex-end' : 'stretch' }}>
+                <div style={{ flex: compact ? '1 1 120px' : undefined }}>
+                    <label style={labelStyle}>Název účtu</label>
+                    <input
+                        type="text"
+                        value={name}
+                        onChange={e => setName(e.target.value)}
+                        style={inputStyle}
+                        placeholder="např. Jelen"
+                    />
+                </div>
+
+                <div style={{ flex: compact ? '2 1 180px' : undefined }}>
+                    <label style={labelStyle}>Flex Token</label>
                     <input
                         type="password"
                         value={token}
-                        onChange={(e) => setToken(e.target.value)}
-                        style={{
-                            width: '100%',
-                            padding: '0.75rem',
-                            borderRadius: '4px',
-                            border: '1px solid #444',
-                            background: '#222',
-                            color: '#fff',
-                            boxSizing: 'border-box'
-                        }}
-                        placeholder="Vložte váš Flex Token"
+                        onChange={e => setToken(e.target.value)}
+                        style={inputStyle}
+                        placeholder="Flex Token"
                         required
                     />
                 </div>
 
-                <div>
-                    <label style={{ display: 'block', marginBottom: '0.5rem', fontSize: '0.9rem' }}>Query ID</label>
+                <div style={{ flex: compact ? '1 1 120px' : undefined }}>
+                    <label style={labelStyle}>Query ID</label>
                     <input
                         type="text"
                         value={queryId}
-                        onChange={(e) => setQueryId(e.target.value)}
-                        style={{
-                            width: '100%',
-                            padding: '0.75rem',
-                            borderRadius: '4px',
-                            border: '1px solid #444',
-                            background: '#222',
-                            color: '#fff',
-                            boxSizing: 'border-box'
-                        }}
-                        placeholder="Vložte Query ID"
+                        onChange={e => setQueryId(e.target.value)}
+                        style={inputStyle}
+                        placeholder="Query ID"
                         required
                     />
-                </div>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                    <input
-                        type="checkbox"
-                        id="remember"
-                        checked={remember}
-                        onChange={(e) => setRemember(e.target.checked)}
-                        style={{ width: '16px', height: '16px' }}
-                    />
-                    <label htmlFor="remember" style={{ fontSize: '0.9rem', cursor: 'pointer' }}>Zapamatovat si mě (uložit do prohlížeče)</label>
                 </div>
 
                 <button
                     type="submit"
                     disabled={loading}
                     style={{
-                        marginTop: '1rem',
-                        padding: '0.75rem',
-                        background: 'var(--primary-color, #3498db)',
+                        padding: compact ? '0.6rem 1rem' : '0.75rem',
+                        background: '#3b82f6',
                         color: '#fff',
                         border: 'none',
-                        borderRadius: '4px',
+                        borderRadius: '6px',
                         cursor: loading ? 'not-allowed' : 'pointer',
                         opacity: loading ? 0.7 : 1,
-                        fontWeight: 'bold'
+                        fontWeight: 'bold',
+                        whiteSpace: 'nowrap',
+                        flex: compact ? '0 0 auto' : undefined,
+                        alignSelf: compact ? 'flex-end' : undefined,
                     }}
                 >
-                    {loading ? 'Načítání...' : 'Načíst Data'}
+                    {loading ? 'Načítání…' : compact ? 'Přidat' : 'Načíst Data'}
                 </button>
             </form>
         </div>

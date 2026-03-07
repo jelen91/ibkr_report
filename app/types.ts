@@ -9,6 +9,7 @@ export interface PositionValue {
     marketValue: number;
     commitedCapital?: number;
     fxRateToBase?: number;
+    multiplier?: number;
     assetClass: 'STK' | 'OPT' | 'CRYPTO' | 'FUT' | string;
     costPrice?: number;
     costBasisPrice?: number;
@@ -30,3 +31,10 @@ export interface MetricItem {
 }
 
 export type AccountData = (PositionItem | MetricItem)[];
+
+export interface Account {
+    id: string;
+    name: string;
+    token: string;
+    queryId: string;
+}

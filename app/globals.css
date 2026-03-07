@@ -202,3 +202,16 @@ td {
     height: 250px !important;
   }
 }
+
+/* ── custom tooltip ─────────────────────────────────────── */
+.tooltip-box {
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.1s;
+}
+
+.tooltip-trigger:hover~.tooltip-box,
+.tooltip-trigger:hover+.tooltip-box {
+  opacity: 1;
+  visibility: visible;
+}

@@ -211,6 +211,7 @@ export async function GET(request: NextRequest) {
         summary.push({ tag: 'OptionValueShort', value: totalOptionsShort, currency: baseCurrency });
         if (latestReportDate) summary.push({ tag: 'ReportDate', value: latestReportDate });
         if (eurToCzkRate !== null) summary.push({ tag: 'EurToCzkRate', value: eurToCzkRate });
+        summary.push({ tag: 'BaseCurrency', value: baseCurrency });
 
         return NextResponse.json([...summary, ...positions]);
 

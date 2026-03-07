@@ -10,34 +10,28 @@ interface CapitalAllocationChartProps {
     futuresValue: number;
     freeCash: number;
     total: number;
-    currency: 'CZK' | 'EUR';
-    eurToCzkRate: number;
+    acctBaseCurrency: string;
 }
 
-export default function CapitalAllocationChart({ stockValue, optionBlocked, longOptionValue, cryptoValue, futuresValue, freeCash, total, currency, eurToCzkRate }: CapitalAllocationChartProps) {
-    const convert = (czk: number) => currency === 'EUR' ? czk / eurToCzkRate : czk;
-
+export default function CapitalAllocationChart({ stockValue, optionBlocked, longOptionValue, cryptoValue, futuresValue, freeCash, acctBaseCurrency }: CapitalAllocationChartProps) {
     const data = [
-        { name: 'Akcie (Long)', value: convert(stockValue), color: '#27ae60' },
-        { name: 'Krypto (Long)', value: convert(cryptoValue), color: '#f1c40f' },
-        { name: 'Futures', value: convert(futuresValue), color: '#9b59b6' },
-        { name: 'Opce (Long)', value: convert(longOptionValue), color: '#e67e22' },
-        { name: 'Blokováno (Short Puts)', value: convert(Math.abs(optionBlocked)), color: '#e74c3c' },
-        { name: 'Volná Hotovost', value: convert(freeCash), color: '#3498db' },
+        { name: 'Akcie (Long)', value: stockValue, color: '#27ae60' },
+        { name: 'Krypto (Long)', value: cryptoValue, color: '#f1c40f' },
+        { name: 'Futures', value: futuresValue, color: '#9b59b6' },
+        { name: 'Opce (Long)', value: longOptionValue, color: '#e67e22' },
+        { name: 'Blokováno (Short Puts)', value: Math.abs(optionBlocked), color: '#e74c3c' },
+        { name: 'Volná Hotovost', value: freeCash, color: '#3498db' },
     ].filter(item => (item.value || 0) > 0);
 
-    const formatCurrency = (val: number) => {
-        return Number(val).toLocaleString('cs-CZ', { maximumFractionDigits: 0 }) + ' ' + currency;
-    };
+    const formatCurrency = (val: number) =>
+        Number(val).toLocaleString('cs-CZ', { maximumFractionDigits: 0 }) + '\u00a0' + acctBaseCurrency;
 
     const renderCustomLabel = ({ cx, cy, midAngle, innerRadius, outerRadius, percent }: any) => {
         const RADIAN = Math.PI / 180;
         const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
         const x = cx + radius * Math.cos(-midAngle * RADIAN);
         const y = cy + radius * Math.sin(-midAngle * RADIAN);
-
         if (percent < 0.05) return null;
-
         return (
             <text x={x} y={y} fill="white" textAnchor={x > cx ? 'start' : 'end'} dominantBaseline="central" style={{ fontSize: '12px', fontWeight: 'bold', textShadow: '1px 1px 2px black' }}>
                 {`${(percent * 100).toFixed(0)}%`}
