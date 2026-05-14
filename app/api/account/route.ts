@@ -5,8 +5,15 @@ import fs from 'fs';
 import path from 'path';
 
 // Header-only mode: Requires x-flex-token and x-flex-query-id headers
-const BASE_URL = "https://www.interactivebrokers.com/Universal/servlet/FlexStatementService.SendRequest";
-const PICKUP_URL = "https://www.interactivebrokers.com/Universal/servlet/FlexStatementService.GetStatement";
+// v3 endpoints per https://www.interactivebrokers.com/campus/ibkr-api-page/flex-web-service/
+const BASE_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest";
+const PICKUP_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement";
+
+// Transient IBKR error codes — safe to retry after a delay.
+// 1001 statement-not-generated, 1004 incomplete, 1005-1008 P/L data not ready,
+// 1009 server-heavy-load, 1018 rate-limit, 1019 in-progress, 1021 retrieval-failed.
+const RETRYABLE_CODES = new Set([1001, 1004, 1005, 1006, 1007, 1008, 1009, 1018, 1019, 1021]);
+const isRetryableCode = (code: unknown) => RETRYABLE_CODES.has(Number(code));
 
 // XML Parser Configuration
 const parser = new XMLParser({
@@ -42,24 +49,39 @@ export async function GET(request: NextRequest) {
     console.log(`Using Token: ${FLEX_TOKEN.substring(0, 4)}... and Query ID: ${FLEX_QUERY_ID}`);
 
     try {
-        // 1. Send Request
-        const initialResponse = await axios.get(BASE_URL, {
-            params: { t: FLEX_TOKEN, q: FLEX_QUERY_ID, v: '3' },
-            headers: { 'User-Agent': 'Java/1.8.0_202' } // Mimic Java client just in case
-        });
+        // 1. Send Request — retry on transient IBKR errors (see RETRYABLE_CODES)
+        const MAX_INITIAL_ATTEMPTS = 3;
+        const INITIAL_RETRY_DELAY_MS = 30000;
 
-        const initialData = parser.parse(initialResponse.data);
+        let responseRoot: any = null;
+        let lastFailErrorCode: string | number | undefined;
+        let lastFailErrorMessage: string | undefined;
 
-        // fast-xml-parser usually returns the root element as a key
-        const responseRoot = initialData.FlexStatementResponse || initialData;
+        for (let attempt = 1; attempt <= MAX_INITIAL_ATTEMPTS; attempt++) {
+            const initialResponse = await axios.get(BASE_URL, {
+                params: { t: FLEX_TOKEN, q: FLEX_QUERY_ID, v: '3' },
+                headers: { 'User-Agent': 'Java/1.8.0_202' } // Mimic Java client just in case
+            });
 
-        if (responseRoot.Status === 'Fail') {
-            return NextResponse.json({ error: responseRoot.ErrorMessage }, { status: 400 });
+            const initialData = parser.parse(initialResponse.data);
+            responseRoot = initialData.FlexStatementResponse || initialData;
+
+            if (responseRoot.Status !== 'Fail') break;
+
+            lastFailErrorCode = responseRoot.ErrorCode;
+            lastFailErrorMessage = responseRoot.ErrorMessage;
+            console.error(`IBKR initial request failed (attempt ${attempt}/${MAX_INITIAL_ATTEMPTS}): code=${lastFailErrorCode} message="${lastFailErrorMessage}"`);
+
+            if (!isRetryableCode(lastFailErrorCode) || attempt === MAX_INITIAL_ATTEMPTS) {
+                return NextResponse.json({ error: lastFailErrorMessage, code: lastFailErrorCode }, { status: 400 });
+            }
+
+            await new Promise(resolve => setTimeout(resolve, INITIAL_RETRY_DELAY_MS));
         }
 
         const referenceCode = responseRoot.ReferenceCode;
         if (!referenceCode) {
-            console.error("Full Initial Response:", JSON.stringify(initialData, null, 2));
+            console.error("Full Initial Response root:", JSON.stringify(responseRoot, null, 2));
             return NextResponse.json({ error: "No reference code returned. Check inputs." }, { status: 500 });
         }
 
@@ -92,7 +114,9 @@ export async function GET(request: NextRequest) {
                     }
                 } else if (pickupRoot?.Status === 'Fail') {
                     const code = pickupRoot.ErrorCode;
-                    if (code === '1019' || code === '1021') continue;
+                    if (isRetryableCode(code)) continue;
+                    console.error(`IBKR pickup failed non-retryable: code=${code} message="${pickupRoot.ErrorMessage}"`);
+                    return NextResponse.json({ error: pickupRoot.ErrorMessage, code }, { status: 400 });
                 }
             } catch (err) {
                 console.error("Polling error:", err);
