@@ -5,7 +5,8 @@ import {
     AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from 'recharts';
 import type { Account } from '../types';
-import type { NavPoint } from '../lib/twr';
+import type { NavPoint, FlowPoint } from '../lib/twr';
+import { computeFire, milestones, DEFAULT_FIRE, type FireInputs } from '../lib/fire';
 
 // ─── typy ─────────────────────────────────────────────────────────────────────
 
@@ -93,12 +94,14 @@ function valueAt(history: Record<string, number>, date: string, sortedKeys: stri
 export default function OverviewPage() {
     const [accounts, setAccounts] = useState<Account[]>([]);
     const [ibkrNav, setIbkrNav] = useState<Record<string, NavPoint[]>>({});
+    const [ibkrFlows, setIbkrFlows] = useState<FlowPoint[]>([]);
     const [ibkrLoading, setIbkrLoading] = useState(false);
     const [ibkrError, setIbkrError] = useState<string | null>(null);
 
     const [holdings, setHoldings] = useState<HoldingRow[]>(DEFAULT_HOLDINGS);
     const [manual, setManual] = useState<ManualRow[]>(DEFAULT_MANUAL);
     const [btcAmount, setBtcAmount] = useState(0);
+    const [fire, setFire] = useState<FireInputs>(DEFAULT_FIRE);
 
     const [quotes, setQuotes] = useState<QuotesPayload | null>(null);
     const [quotesError, setQuotesError] = useState<string | null>(null);
@@ -124,6 +127,7 @@ export default function OverviewPage() {
             if (Array.isArray(st.holdings)) setHoldings(st.holdings);
             if (Array.isArray(st.manual)) setManual(st.manual);
             if (typeof st.btcAmount === 'number') setBtcAmount(st.btcAmount);
+            if (st.fire && typeof st.fire === 'object') setFire({ ...DEFAULT_FIRE, ...st.fire });
         } catch { /* výchozí hodnoty */ }
 
         setHydrated(true);
@@ -133,8 +137,8 @@ export default function OverviewPage() {
     // ── uložení ──
     useEffect(() => {
         if (!hydrated) return;
-        localStorage.setItem(LS_OVERVIEW, JSON.stringify({ holdings, manual, btcAmount }));
-    }, [hydrated, holdings, manual, btcAmount]);
+        localStorage.setItem(LS_OVERVIEW, JSON.stringify({ holdings, manual, btcAmount, fire }));
+    }, [hydrated, holdings, manual, btcAmount, fire]);
 
     // ── kurzy ──
     // Debounce, aby se při psaní tickeru neposílal dotaz na každý znak.
@@ -167,17 +171,19 @@ export default function OverviewPage() {
             });
             const json = await res.json();
             if (!res.ok) throw new Error(json.error || 'Chyba načítání');
-            return [acct.id, json.nav as NavPoint[]] as const;
+            return [acct.id, json.nav as NavPoint[], (json.flows ?? []) as FlowPoint[]] as const;
         }));
 
         const loaded: Record<string, NavPoint[]> = {};
+        const flows: FlowPoint[] = [];
         const failures: string[] = [];
         results.forEach((r, i) => {
-            if (r.status === 'fulfilled') loaded[r.value[0]] = r.value[1];
+            if (r.status === 'fulfilled') { loaded[r.value[0]] = r.value[1]; flows.push(...r.value[2]); }
             else failures.push(`${list[i].name}: ${r.reason?.message ?? r.reason}`);
         });
 
         setIbkrNav(loaded);
+        setIbkrFlows(flows);
         setIbkrError(failures.length ? failures.join(' · ') : null);
         setIbkrLoading(false);
     }
@@ -341,8 +347,31 @@ export default function OverviewPage() {
             ? { abs: last.total - first.total, pct: (last.total / first.total - 1) * 100, from: first.date }
             : null;
 
-        return { parts, total, chart: trimmed, growth, holdingValues, btcQuote, btcValue, ibkrRows, ibkrTotal };
-    }, [accounts, ibkrNav, holdings, manual, btcAmount, quotes]);
+        // ── FIRE ──────────────────────────────────────────────────────────
+        // Návrh měsíčního vkladu se bere ze skutečných převodů na IBKR za
+        // posledního půl roku. Starší období by zkreslil jednorázový převod
+        // úspor při zakládání účtu.
+        const sixMonthsAgo = (() => {
+            const d = new Date();
+            d.setMonth(d.getMonth() - 6);
+            return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+        })();
+        const recentDeposits = ibkrFlows
+            .filter(f => f.date >= sixMonthsAgo)
+            .reduce((sum, f) => sum + f.amount, 0);
+        const suggestedMonthly = Math.max(0, Math.round(recentDeposits / 6));
+
+        const fireInputs: FireInputs = { ...fire, current: total };
+        const fireResult = computeFire(fireInputs);
+        const fireMilestones = milestones(fireInputs, [5_000_000, 10_000_000, 15_000_000, fire.target])
+            .filter((ms, i, arr) => arr.findIndex(o => o.level === ms.level) === i && ms.level <= fire.target)
+            .sort((a, b) => a.level - b.level);
+
+        return {
+            parts, total, chart: trimmed, growth, holdingValues, btcQuote, btcValue, ibkrRows, ibkrTotal,
+            fireInputs, fireResult, fireMilestones, suggestedMonthly,
+        };
+    }, [accounts, ibkrNav, ibkrFlows, holdings, manual, btcAmount, quotes, fire]);
 
     // ── editace ──
     const updateHolding = (id: string, patch: Partial<HoldingRow>) =>
@@ -425,6 +454,13 @@ export default function OverviewPage() {
                         </p>
                     ) : null}
                 </div>
+
+                {/* ── FIRE ── */}
+                <FireSection
+                    view={view}
+                    fire={fire}
+                    setFire={setFire}
+                />
 
                 {/* ── graf ── */}
                 {view.chart.length > 1 && (
@@ -671,7 +707,224 @@ export default function OverviewPage() {
     );
 }
 
+
+// ─── FIRE ─────────────────────────────────────────────────────────────────────
+
+/** Desetinné číslo s českou čárkou. */
+const dec = (v: number, digits = 1) =>
+    v.toLocaleString('cs-CZ', { minimumFractionDigits: digits, maximumFractionDigits: digits });
+
+/** "1 rok", "3 roky", "6 let" — česká číslovka se podle počtu mění. */
+const yearWord = (y: number) => (y === 1 ? 'rok' : y >= 2 && y <= 4 ? 'roky' : 'let');
+
+const fmtYears = (months: number | null) => {
+    if (months === null) return 'nikdy při tomhle tempu';
+    if (months <= 0) return 'hotovo';
+    const y = Math.floor(months / 12);
+    const m = Math.round(months % 12);
+    if (y === 0) return `${m} měs.`;
+    return m === 0 ? `${y} ${yearWord(y)}` : `${y} ${yearWord(y)} ${m} měs.`;
+};
+
+const fmtMonthYear = (d: Date | null) =>
+    d ? d.toLocaleDateString('cs-CZ', { month: 'long', year: 'numeric' }) : '—';
+
+function FireSection({ view, fire, setFire }: {
+    view: any;
+    fire: FireInputs;
+    setFire: (f: FireInputs) => void;
+}) {
+    const r = view.fireResult;
+    const pct = r.progress * 100;
+    const set = (patch: Partial<FireInputs>) => setFire({ ...fire, ...patch });
+
+    return (
+        <div className="card" style={{ borderLeft: `4px solid ${COLORS[2]}` }}>
+            <h3 style={{ marginTop: 0 }}>Cesta k finanční nezávislosti</h3>
+
+            {/* postup */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', fontSize: '0.85rem', marginBottom: '0.4rem' }}>
+                <span><strong style={{ fontSize: '1.15rem', color: COLORS[2] }}>{dec(pct)} %</strong> cíle</span>
+                <span style={{ color: 'var(--text-secondary)' }}>
+                    {fmtCzk(view.total)} z {fmtCzk(fire.target)}
+                </span>
+            </div>
+            <div style={{ height: 12, background: '#0f172a', borderRadius: 999, overflow: 'hidden', border: '1px solid #334155' }}>
+                <div style={{
+                    width: `${Math.min(100, pct)}%`, height: '100%',
+                    background: `linear-gradient(90deg, ${COLORS[0]}, ${COLORS[2]})`,
+                }} />
+            </div>
+
+            {/* hlavní čísla */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.75rem', margin: '1.25rem 0' }}>
+                <Stat
+                    label="Portfolio si vydělá samo"
+                    value={fmtCzk(r.passiveAnnual)}
+                    sub={`${fmtCzk(r.passiveMonthly)} měsíčně při ${dec(fire.annualReturn * 100, 0)} %`}
+                    color={COLORS[2]}
+                />
+                <Stat
+                    label="Kdybys žil z portfolia dnes"
+                    value={fmtCzk(r.withdrawNow)}
+                    sub={`měsíčně podle pravidla ${dec(fire.withdrawalRate * 100, 2)} %`}
+                    color={COLORS[0]}
+                />
+                <Stat
+                    label="Do cíle zbývá"
+                    value={fmtYears(r.monthsToGoal)}
+                    sub={r.targetDate ? fmtMonthYear(r.targetDate) : 'zvyš vklad nebo sniž cíl'}
+                    color={COLORS[1]}
+                />
+                <Stat
+                    label="Až tam budeš, vybereš si"
+                    value={fmtCzk(r.withdrawAtTarget)}
+                    sub="měsíčně, napořád"
+                    color={COLORS[3]}
+                />
+            </div>
+
+            {/* parametry */}
+            <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', alignItems: 'center', padding: '0.75rem 0', borderTop: '1px solid #334155', borderBottom: '1px solid #334155' }}>
+                <label style={fireLabel}>
+                    Cíl
+                    <input type="number" value={fire.target || ''} step="1000000"
+                        onChange={e => set({ target: Number(e.target.value) || 0 })}
+                        style={{ ...inputStyle, width: '130px' }} /> Kč
+                </label>
+                <label style={fireLabel}>
+                    Měsíčně přidávám
+                    <input type="number" value={fire.monthly || ''}
+                        onChange={e => set({ monthly: Number(e.target.value) || 0 })}
+                        style={{ ...inputStyle, width: '120px' }} /> Kč
+                </label>
+                {view.suggestedMonthly > 0 && view.suggestedMonthly !== fire.monthly && (
+                    <button onClick={() => set({ monthly: view.suggestedMonthly })} style={hintStyle}>
+                        použít {fmtCzk(view.suggestedMonthly)} podle skutečných vkladů
+                    </button>
+                )}
+                <label style={fireLabel}>
+                    Zhodnocení
+                    <input type="number" value={(fire.annualReturn * 100).toFixed(1)} step="0.5"
+                        onChange={e => set({ annualReturn: (Number(e.target.value) || 0) / 100 })}
+                        style={{ ...inputStyle, width: '70px' }} /> % ročně
+                </label>
+                <label style={fireLabel}>
+                    Výběr
+                    <input type="number" value={(fire.withdrawalRate * 100).toFixed(2)} step="0.25"
+                        onChange={e => set({ withdrawalRate: (Number(e.target.value) || 0) / 100 })}
+                        style={{ ...inputStyle, width: '70px' }} /> % ročně
+                </label>
+                <label style={fireLabel}>
+                    Inflace
+                    <input type="number" value={(fire.inflation * 100).toFixed(1)} step="0.5"
+                        onChange={e => set({ inflation: (Number(e.target.value) || 0) / 100 })}
+                        style={{ ...inputStyle, width: '70px' }} /> %
+                </label>
+            </div>
+
+            {/* mezicíle */}
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.85rem', marginTop: '1rem' }}>
+                <thead>
+                    <tr style={{ borderBottom: '1px solid #475569' }}>
+                        <th style={thStyle}>Meta</th>
+                        <th style={thStyle}>Zbývá</th>
+                        <th style={thStyle}>Kdy</th>
+                        <th style={{ ...thStyle, textAlign: 'right' }}>Měsíční výběr</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {view.fireMilestones.map((ms: any) => (
+                        <tr key={ms.level} style={{ borderBottom: '1px solid #334155', opacity: ms.reached ? 0.5 : 1 }}>
+                            <td style={tdStyle}>{ms.reached ? '✓ ' : ''}{fmtCzk(ms.level)}</td>
+                            <td style={tdStyle}>{ms.reached ? 'máš' : fmtYears(ms.months)}</td>
+                            <td style={{ ...tdStyle, color: 'var(--text-secondary)' }}>
+                                {ms.reached ? '—' : fmtMonthYear(ms.date)}
+                            </td>
+                            <td style={{ ...tdStyle, textAlign: 'right', fontWeight: 600 }}>
+                                {fmtCzk(ms.withdrawal)}
+                            </td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
+
+            {/* co z toho plyne */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '0.75rem', marginTop: '1.25rem' }}>
+                <Insight title="Má smysl přidávat dál?">
+                    Každých <strong>10 000 Kč měsíčně navíc</strong> ti cíl přiblíží
+                    o <strong style={{ color: COLORS[2] }}>{r.monthsSavedPer10k !== null ? dec(r.monthsSavedPer10k) : '—'} měsíce</strong>.
+                    {r.crossoverPortfolio !== null && (
+                        <> Zatím dělá trh {dec((r.growthFromMarket / (r.growthFromMarket + r.growthFromDeposits)) * 100, 0)} %
+                            měsíčního přírůstku a zbytek přidáváš ty. Poprvé tě přeroste
+                            při <strong>{fmtCzk(r.crossoverPortfolio)}</strong>, tedy zhruba
+                            za <strong style={{ color: COLORS[2] }}>{fmtYears(r.crossoverMonths)}</strong> — od té chvíle
+                            pracuje portfolio víc než ty.</>
+                    )}
+                </Insight>
+
+                <Insight title="Kdybys od teď nepřidal ani korunu">
+                    Cíle dosáhneš i tak, jen ti to potrvá <strong>{fmtYears(r.coastMonths)}</strong>
+                    {' '}({fmtMonthYear(r.coastDate)}) — o {fmtYears(
+                        r.coastMonths !== null && r.monthsToGoal !== null ? r.coastMonths - r.monthsToGoal : null,
+                    )} déle než při současném tempu.
+                </Insight>
+
+                <Insight title="Pozor na kupní sílu">
+                    {r.targetInTodaysMoney !== null ? (
+                        <>{fmtCzk(fire.target)} za {fmtYears(r.monthsToGoal)} bude při {dec(fire.inflation * 100)} %
+                            inflaci odpovídat <strong>{fmtCzk(r.targetInTodaysMoney)}</strong> dnešních.
+                            Ten měsíční výběr {fmtCzk(r.withdrawAtTarget)} tedy bude působit spíš
+                            jako {fmtCzk(r.withdrawAtTarget * (r.targetInTodaysMoney / fire.target))} dnes.</>
+                    ) : 'Zadej vklad a zhodnocení, ať je z čeho počítat.'}
+                </Insight>
+            </div>
+
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: 0, marginTop: '1rem', lineHeight: 1.7 }}>
+                Není to předpověď, ale jedna varianta „když to půjde takhle dál“. Průměrné zhodnocení se
+                v jednotlivých letech nedodrží a nejvíc rozhodne, jak vyjdou hned ty první — stejný průměr
+                se špatným začátkem znamená výrazně horší výsledek. Pravidlo 4 % navíc vzniklo pro
+                třicetiletý horizont; na dřívější odchod do důchodu se běžně doporučuje spíš 3,25 až 3,5 %,
+                zkus si to v poli výše přepnout a uvidíš rozdíl.
+            </p>
+        </div>
+    );
+}
+
+function Stat({ label, value, sub, color }: { label: string; value: string; sub: string; color: string }) {
+    return (
+        <div style={{ background: '#0f172a', borderRadius: 'var(--border-radius)', padding: '0.85rem 1rem', border: '1px solid #334155' }}>
+            <div style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--text-secondary)', fontWeight: 600 }}>
+                {label}
+            </div>
+            <div style={{ fontSize: '1.35rem', fontWeight: 700, color, marginTop: '0.3rem' }}>{value}</div>
+            <div style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.15rem' }}>{sub}</div>
+        </div>
+    );
+}
+
+function Insight({ title, children }: { title: string; children: React.ReactNode }) {
+    return (
+        <div style={{ fontSize: '0.82rem', lineHeight: 1.7 }}>
+            <div style={{ fontWeight: 700, marginBottom: '0.3rem' }}>{title}</div>
+            <div style={{ color: 'var(--text-secondary)' }}>{children}</div>
+        </div>
+    );
+}
+
+const fireLabel: React.CSSProperties = {
+    display: 'inline-flex', alignItems: 'center', gap: '0.4rem',
+    fontSize: '0.78rem', color: 'var(--text-secondary)',
+};
+
+const hintStyle: React.CSSProperties = {
+    fontSize: '0.72rem', padding: '3px 9px', borderRadius: '6px',
+    border: '1px dashed #475569', background: 'transparent',
+    color: '#94a3b8', cursor: 'pointer',
+};
+
 // ─── styly ────────────────────────────────────────────────────────────────────
+
 
 const thStyle: React.CSSProperties = {
     padding: '0.5rem 0.5rem 0.5rem 0',
