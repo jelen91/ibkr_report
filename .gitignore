@@ -57,3 +57,6 @@ venv
 backend/.venv
 backend/venv
 .pytest_cache/
+
+# Cache výkonnosti (obsahuje NAV a pohyby na účtu)
+/data/perf-*.json
