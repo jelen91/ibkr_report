@@ -1,4 +1,10 @@
 export interface PositionValue {
+    accountId?: string;
+    accountName?: string;
+    conid?: string;
+    underlyingConid?: string;
+    tradingClass?: string;
+    model?: string;
     symbol: string;
     underlying?: string;
     expiry?: string | number;
@@ -8,6 +14,8 @@ export interface PositionValue {
     markPrice: number;
     marketValue: number;
     commitedCapital?: number;
+    netCommitedCapital?: number;
+    hedgedQty?: number;
     fxRateToBase?: number;
     multiplier?: number;
     assetClass: 'STK' | 'OPT' | 'CRYPTO' | 'FUT' | string;

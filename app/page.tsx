@@ -1,58 +1,20 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import CapitalAllocationChart from './components/CapitalAllocationChart';
 import UtilizationBar from './components/UtilizationBar';
+import ExposureSummary from './components/ExposureSummary';
+import { computeExposure, type ExposureCategory } from './lib/exposure';
 import PositionTable from './components/PositionTable';
 import CredentialsForm from './components/CredentialsForm';
 import Instructions from './components/Instructions';
 import { AccountData, PositionItem, Account } from './types';
+import { mergeAccountDatas, annotatePutCommitments } from './lib/account';
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-function mergeAccountDatas(datasets: { data: AccountData; name: string }[]): AccountData {
-  const result: AccountData = [];
-  let netLiq = 0, cash = 0, stockLong = 0, optShort = 0;
-  let reportDate: string | null = null;
-  let baseCurrency = 'CZK';
-
-  for (const { data, name } of datasets) {
-    for (const item of data) {
-      if (item.tag === 'Position') {
-        // Annotate with account name for the Účet column
-        const annotated = { ...item, value: { ...(item as any).value, accountName: name } };
-        result.push(annotated);
-      } else if (item.tag === 'NetLiquidation') {
-        netLiq += Number(item.value);
-      } else if (item.tag === 'AvailableFunds') {
-        cash += Number(item.value);
-      } else if (item.tag === 'StockValueLong') {
-        stockLong += Number(item.value);
-      } else if (item.tag === 'OptionValueShort') {
-        optShort += Number(item.value);
-      } else if (item.tag === 'ReportDate' && !reportDate) {
-        reportDate = String(item.value);
-        result.push(item);
-      } else if (item.tag === 'BaseCurrency' && !result.find(r => r.tag === 'BaseCurrency')) {
-        baseCurrency = String(item.value);
-        result.push(item);
-      } else if (item.tag === 'EurToCzkRate' && !result.find(r => r.tag === 'EurToCzkRate')) {
-        result.push(item);
-      }
-    }
-  }
-
-  result.unshift(
-    { tag: 'NetLiquidation', value: netLiq, currency: baseCurrency },
-    { tag: 'AvailableFunds', value: cash, currency: baseCurrency },
-    { tag: 'StockValueLong', value: stockLong, currency: baseCurrency },
-    { tag: 'OptionValueShort', value: optShort, currency: baseCurrency },
-  );
-
-  return result;
-}
-
 const LS_ACCOUNTS = 'ibkr_accounts';
+const LS_EXPOSURE_CATEGORIES = 'ibkr_exposure_categories';
 
 function loadAccounts(): Account[] {
   try {
@@ -69,15 +31,23 @@ function saveAccounts(accounts: Account[]) {
 // ─── component ────────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
+  const [exposureCategories, setExposureCategories] = useState<Record<string, ExposureCategory>>({});
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [activeId, setActiveId] = useState<string | 'all'>('all');
   const [dataCache, setDataCache] = useState<Record<string, AccountData>>({});
   const [loadingIds, setLoadingIds] = useState<Set<string>>(new Set());
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [showAddForm, setShowAddForm] = useState(false);
+  const pending = useRef(new Set<string>());
 
   // ── init from localStorage ──
   useEffect(() => {
+    try {
+      const savedCategories = JSON.parse(localStorage.getItem(LS_EXPOSURE_CATEGORIES) || '{}');
+      if (savedCategories && typeof savedCategories === 'object' && !Array.isArray(savedCategories)) {
+        setExposureCategories(Object.fromEntries(Object.entries(savedCategories).filter(([, value]) => ['equities', 'commodities', 'crypto'].includes(String(value)))) as Record<string, ExposureCategory>);
+      }
+    } catch { /* default categories */ }
     const saved = loadAccounts();
     if (saved.length > 0) {
       setAccounts(saved);
@@ -95,8 +65,18 @@ export default function Dashboard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts]);
 
+  function updateExposureCategory(key: string, category: ExposureCategory) {
+    setExposureCategories(previous => {
+      const next = { ...previous, [key]: category };
+      try { localStorage.setItem(LS_EXPOSURE_CATEGORIES, JSON.stringify(next)); } catch { /* unavailable browser storage */ }
+      return next;
+    });
+  }
+
   // ── fetch one account ──
   async function fetchAccount(acct: Account) {
+    if (pending.current.has(acct.id)) return;
+    pending.current.add(acct.id);
     setLoadingIds(prev => new Set(prev).add(acct.id));
     setErrors(prev => { const e = { ...prev }; delete e[acct.id]; return e; });
     try {
@@ -112,6 +92,7 @@ export default function Dashboard() {
     } catch (e: any) {
       setErrors(prev => ({ ...prev, [acct.id]: e.message }));
     } finally {
+      pending.current.delete(acct.id);
       setLoadingIds(prev => { const s = new Set(prev); s.delete(acct.id); return s; });
     }
   }
@@ -141,13 +122,17 @@ export default function Dashboard() {
     .map(a => dataCache[a.id] ? { data: dataCache[a.id], name: a.name } : null)
     .filter(Boolean) as { data: AccountData; name: string }[];
 
-  const activeData: AccountData | null = (() => {
-    if (accounts.length === 0) return null;
+  let mergeError: string | undefined;
+  let activeData: AccountData | null = null;
+  try {
     if (activeId === 'all') {
-      return loadedPairs.length > 0 ? mergeAccountDatas(loadedPairs) : null;
-    }
-    return dataCache[activeId] ?? null;
-  })();
+      // A partial set of accounts must never be presented as the complete total.
+      activeData = loadedPairs.length === accounts.length && accounts.length > 0
+        ? mergeAccountDatas(loadedPairs) : null;
+    } else activeData = dataCache[activeId] ?? null;
+  } catch (error) {
+    mergeError = error instanceof Error ? error.message : 'Účty nelze sloučit.';
+  }
 
   const showAccountCol = activeId === 'all' && accounts.length > 1;
 
@@ -155,9 +140,9 @@ export default function Dashboard() {
     ? loadingIds.size > 0
     : loadingIds.has(activeId);
 
-  const activeError = activeId === 'all'
+  const activeError = mergeError ?? (activeId === 'all'
     ? Object.values(errors)[0]
-    : errors[activeId];
+    : errors[activeId]);
 
   // ── derived metrics ──
   const getMetricValue = (tag: string): string | number => {
@@ -175,11 +160,12 @@ export default function Dashboard() {
   };
 
   const isPosition = (p: any): p is PositionItem => p.tag === 'Position';
-  const positions = activeData?.filter(isPosition) || [];
+  const positions = annotatePutCommitments(activeData?.filter(isPosition) || []);
   const stocks = positions.filter(p => p.value.assetClass === 'STK');
   const cryptos = positions.filter(p => p.value.assetClass === 'CRYPTO');
   const futures = positions.filter(p => p.value.assetClass === 'FUT');
   const options = positions.filter(p => p.value.assetClass === 'OPT');
+  const otherPositions = positions.filter(p => !['STK', 'CRYPTO', 'FUT', 'OPT'].includes(p.value.assetClass));
 
   options.sort((a, b) => {
     const parseDate = (expiry: string | number | undefined) => {
@@ -195,68 +181,19 @@ export default function Dashboard() {
   });
 
   const netLiquidation = Number(getMetricValue('NetLiquidation'));
-  const availableFunds = Number(getMetricValue('AvailableFunds'));
+  const cashBalance = Number(getMetricValue('CashBalance'));
+  const dataWarning = String(getMetricValue('DataWarning') || '');
   const acctBaseCurrency = String(getMetricValue('BaseCurrency') || 'CZK');
   const formatDisplay = (v: number) =>
-    v.toLocaleString('cs-CZ', { maximumFractionDigits: 0 }) + '\u00a0' + acctBaseCurrency;
+    v.toLocaleString('cs-CZ', { maximumFractionDigits: 2 }) + '\u00a0' + acctBaseCurrency;
 
-  const stockValueLong = stocks.reduce((s, i) => s + (i.value.marketValue || 0) * (i.value.fxRateToBase || 1), 0);
-  const cryptoValue = cryptos.reduce((s, i) => s + (i.value.marketValue || 0) * (i.value.fxRateToBase || 1), 0);
-  const futuresValue = futures.reduce((s, i) => s + (i.value.marketValue || 0) * (i.value.fxRateToBase || 1), 0);
-
-  // ── spread-aware committed capital + per-position annotation ────────────────
-  // For bear put spreads (short low strike + long high strike on same underlying),
-  // the real capital at risk is only (shortStrike - longStrike) × mult × qty ≤ 0 → 0.
-  const totalCommitedCapital = (() => {
-    const shortPuts = options.filter(o => o.value.type === 'PUT' && o.value.quantity < 0);
-    const longPuts = options.filter(o => o.value.type === 'PUT' && o.value.quantity > 0);
-
-    // Build a mutable long-put pool keyed by underlying (shared across all short puts)
-    const longPool: Record<string, { strike: number; qty: number }[]> = {};
-    for (const lp of longPuts) {
-      const key = lp.value.underlying || lp.value.symbol;
-      if (!longPool[key]) longPool[key] = [];
-      longPool[key].push({ strike: lp.value.strike || 0, qty: lp.value.quantity });
-      longPool[key].sort((a, b) => b.strike - a.strike); // best protection first
-    }
-
-    let total = 0;
-    for (const sp of shortPuts) {
-      const key = sp.value.underlying || sp.value.symbol;
-      const shortQty = Math.abs(sp.value.quantity);
-      const shortStrike = sp.value.strike || 0;
-      const mult = sp.value.multiplier || 100;
-      const fx = sp.value.fxRateToBase || 1;
-
-      let remainingQty = shortQty;
-      let commitmentBase = 0; // in base currency
-
-      for (const lp of (longPool[key] ?? [])) {
-        if (remainingQty <= 0) break;
-        if (lp.strike <= shortStrike) continue;
-        const covered = Math.min(remainingQty, lp.qty);
-        commitmentBase += Math.max(0, shortStrike - lp.strike) * mult * covered * fx;
-        lp.qty -= covered;
-        remainingQty -= covered;
-      }
-      commitmentBase += shortStrike * mult * remainingQty * fx;
-
-      // Annotate the position: net committed capital in native currency (per contract)
-      // so PositionTable can compute %.  Raw = shortStrike × mult × |qty| (native).
-      (sp.value as any).netCommitedCapital = commitmentBase / fx; // back to native
-      (sp.value as any).hedgedQty = shortQty - remainingQty; // how many are hedged
-
-      total += commitmentBase;
-    }
-    return total;
-  })();
-
-  const longOptionValue = options
-    .filter(o => (o.value.type === 'CALL' || o.value.type === 'PUT') && o.value.quantity > 0)
-    .reduce((s, i) => s + (i.value.marketValue || 0) * (i.value.fxRateToBase || 1), 0);
-  const totalAllocated = stockValueLong + cryptoValue + futuresValue + Math.abs(totalCommitedCapital) + longOptionValue;
-  const allocatedAlloc = netLiquidation ? (totalAllocated / netLiquidation * 100).toFixed(1) : '0';
-  const derivedCash = Math.max(0, netLiquidation - totalAllocated);
+  const sumInBase = (items: PositionItem[]) => items.reduce((sum, p) => sum + p.value.marketValue * (p.value.fxRateToBase ?? 1), 0);
+  const stockValue = sumInBase(stocks);
+  const cryptoValue = sumInBase(cryptos);
+  const optionValue = sumInBase(options);
+  // Futures notionals are exposures, not amounts paid or components of NAV.
+  const otherValue = netLiquidation - cashBalance - stockValue - cryptoValue - optionValue;
+  const exposure = computeExposure(positions, netLiquidation, exposureCategories);
   const reportDate = getReportDate();
 
   // ─── shared position table props ───
@@ -360,35 +297,41 @@ export default function Dashboard() {
       {/* Dashboard */}
       {activeData && (
         <>
+          {(activeError || dataWarning) && <div className="content-container"><p role="status">{activeError ? 'Zobrazená data jsou z posledního úspěšného stažení. ' : ''}{dataWarning}</p></div>}
           <div className="responsive-grid">
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', justifyContent: 'space-between' }}>
               <div className="card summary-card">
-                <h3>Čistá Likvidace</h3>
+                <h3>AUM / čistá hodnota účtu</h3>
                 <div className="value">{formatDisplay(netLiquidation)}</div>
                 <div className="subtext">Celková hodnota účtu</div>
               </div>
               <div className="card summary-card">
-                <h3>Investovaný Kapitál</h3>
-                <div className="value">{formatDisplay(totalAllocated)}</div>
-                <div className="subtext">Aktiva + Blokované opce ({allocatedAlloc}%)</div>
+                <h3>Hotovost ve výpisu</h3>
+                <div className="value">{formatDisplay(cashBalance)}</div>
+                <div className="subtext">Zůstatek hotovosti včetně případného úvěru</div>
               </div>
-              <UtilizationBar invested={totalAllocated} total={netLiquidation} />
+              <div className="card summary-card">
+                <h3>Vázaný kapitál</h3>
+                <div className="value">{exposure.percentage === null ? '—' : formatDisplay(exposure.total)}</div>
+                <div className="subtext">Držené akcie, ETF a krypto {formatDisplay(exposure.investedHoldings)} + závazek PUT {formatDisplay(exposure.putCommitments)}.</div>
+              </div>
+              <UtilizationBar invested={exposure.total} total={netLiquidation} complete={exposure.percentage !== null} />
             </div>
 
             <CapitalAllocationChart
-              stockValue={stockValueLong}
+              stockValue={stockValue}
               cryptoValue={cryptoValue}
-              futuresValue={futuresValue}
-              optionBlocked={totalCommitedCapital}
-              longOptionValue={longOptionValue}
-              freeCash={derivedCash}
+              optionValue={optionValue}
+              otherValue={otherValue}
+              cashBalance={cashBalance}
               total={netLiquidation}
               acctBaseCurrency={acctBaseCurrency}
             />
           </div>
 
           <div className="content-container">
-            <div style={{ height: '3rem' }} />
+            <ExposureSummary exposure={exposure} nav={netLiquidation} currency={acctBaseCurrency} onCategoryChange={updateExposureCategory} />
+            <p className="subtext">Hodnoty pocházejí z denního Flex výpisu, nejde o živé kotace. Záporné hodnoty představují závazky.</p>
 
             <PositionTable title="Short Puts (Příjem)"
               data={options.filter(o => o.value.type === 'PUT' && o.value.quantity < 0)}
@@ -420,10 +363,15 @@ export default function Dashboard() {
               columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Asset', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
               color="var(--primary-color)" {...tableProps} />
 
-            <PositionTable title="Futures"
+            <PositionTable title="Futures (nominální expozice)"
               data={futures}
-              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Expirace', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Blokováno $', 'Blokováno CZK', '%']}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Expirace', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
               color="var(--futures-color)" {...tableProps} />
+            <PositionTable title="Ostatní instrumenty"
+              data={otherPositions}
+              columns={[...(showAccountCol ? ['Účet'] : []), 'Ticker', 'Asset', 'Ks', 'Avg Price', 'Cena', 'P/L', 'Hodnota $', 'Hodnota CZK', '%']}
+              color="var(--primary-color)" {...tableProps} />
+
           </div>
         </>
       )}

@@ -1,201 +1,234 @@
-// Time-weighted return (TWR) — výnos portfolia očištěný o vklady a výběry.
-//
-// Proč TWR: samotná NAV se hýbe i tím, že pošleš na účet peníze. Bez očištění
-// by vklad 150 000 Kč vypadal jako +5 % denní výnos. TWR řetězí denní výnosy,
-// z nichž je vždy odečten cash flow daného dne, takže měří výhradně výkon
-// obchodování — a je tím pádem přímo srovnatelný s indexem.
+// Account-level TWR uses end-of-day external flows, as documented by IBKR
+// PortfolioAnalyst. Never infer a flow's date by optimizing the resulting return.
 
-export interface NavPoint {
-    date: string;   // YYYYMMDD
-    nav: number;    // v bázové měně účtu
-}
-
-export interface FlowPoint {
-    date: string;   // YYYYMMDD
-    amount: number; // + vklad, − výběr, v bázové měně
-}
-
+export interface NavPoint { date: string; nav: number }
+export interface FlowPoint { date: string; amount: number }
 export interface TwrPoint {
     date: string;
-    index: number;   // kumulativní index, start = 1
-    nav: number;     // NAV daného dne (v požadované měně)
-    flow: number;    // cash flow přiřazený tomuto dni (v požadované měně)
-    stale: boolean;  // true = den přeskočen (NAV pod prahem), výnos se nezapočítal
+    index: number;
+    nav: number;
+    flow: number;
+    stale: boolean;
 }
 
-/**
- * Přiřadí každý vklad/výběr ke dni, kdy se skutečně projevil v NAV.
- *
- * IBKR datuje pohyb ve Statement of Funds podle dne zadání, ale do denního
- * NAV snapshotu se občas dostane až následující obchodní den (typicky u převodů
- * zadaných po uzávěrce nebo přes svátek). Kdyby se to ignorovalo, vznikl by
- * v grafu falešný pár outlierů: jeden den −5 %, druhý +5 %.
- *
- * Detekce je datová, ne heuristika podle času: vklad je řádově větší než běžný
- * denní pohyb NAV (u tohoto účtu medián 1 264 Kč vs. vklady 15 000–1 850 000 Kč),
- * takže se prostě vybere den, jehož skok NAV je daným pohybem vysvětlen lépe.
- * Vklady v sousedních dnech se řeší společně — jinak by se u dvojice 25./26. 5.
- * (svátek Memorial Day) první z nich přiřadil špatně.
- */
-export function assignFlowLandingDays(nav: NavPoint[], flows: FlowPoint[]): Record<string, number> {
-    const dates = nav.map(n => n.date);
-    const idx = new Map(dates.map((d, i) => [d, i]));
-    const navBy = new Map(nav.map(n => [n.date, n.nav]));
+export function isValidYmd(date: string): boolean {
+    if (!/^\d{8}$/.test(date)) return false;
+    const d = new Date(Date.UTC(+date.slice(0, 4), +date.slice(4, 6) - 1, +date.slice(6, 8)));
+    return d.toISOString().slice(0, 10).replaceAll('-', '') === date;
+}
 
-    // Součet pohybů na den (za jeden den může být víc převodů)
-    const byDate = new Map<string, number>();
-    for (const f of flows) {
-        if (!idx.has(f.date)) continue; // pohyb mimo rozsah NAV řady
-        byDate.set(f.date, (byDate.get(f.date) ?? 0) + f.amount);
-    }
-
-    const flowDates = [...byDate.keys()].sort();
-    if (flowDates.length === 0) return {};
-
-    // Shluky sousedních dnů s pohybem (musí se optimalizovat společně)
-    const clusters: string[][] = [];
-    let cur = [flowDates[0]];
-    for (const d of flowDates.slice(1)) {
-        if (idx.get(d)! - idx.get(cur[cur.length - 1])! <= 1) cur.push(d);
-        else { clusters.push(cur); cur = [d]; }
-    }
-    clusters.push(cur);
-
-    const dayChange = (d: string) => {
-        const i = idx.get(d)!;
-        if (i === 0) return NaN;
-        return navBy.get(d)! - navBy.get(dates[i - 1])!;
-    };
-
-    const landed: Record<string, number> = {};
-
-    for (const cluster of clusters) {
-        // Každý pohyb může přistát v den D nebo D+1 → 2^k kombinací (k ≤ 3 v praxi)
-        let best: { cost: number; assign: Map<string, number> } | null = null;
-        const combos = 1 << cluster.length;
-
-        for (let mask = 0; mask < combos; mask++) {
-            const assign = new Map<string, number>();
-            for (let k = 0; k < cluster.length; k++) {
-                const shift = (mask >> k) & 1;
-                const target = dates[Math.min(idx.get(cluster[k])! + shift, dates.length - 1)];
-                assign.set(target, (assign.get(target) ?? 0) + byDate.get(cluster[k])!);
-            }
-
-            // Cena = kolik pohybu NAV zůstane nevysvětleno. Menší = lepší.
-            const affected = new Set<string>();
-            for (const d of cluster) {
-                affected.add(d);
-                affected.add(dates[Math.min(idx.get(d)! + 1, dates.length - 1)]);
-            }
-            let cost = 0;
-            for (const d of affected) {
-                const change = dayChange(d);
-                if (!Number.isFinite(change)) continue;
-                cost += Math.abs(change - (assign.get(d) ?? 0));
-            }
-
-            if (best === null || cost < best.cost) best = { cost, assign };
+function validateNav(nav: NavPoint[]): void {
+    for (let i = 0; i < nav.length; i++) {
+        if (!isValidYmd(nav[i].date) || !Number.isFinite(nav[i].nav)
+            || (i > 0 && nav[i].date <= nav[i - 1].date)) {
+            throw new Error('NAV musí obsahovat platné, jedinečné a vzestupně seřazené dny a konečné částky.');
         }
-
-        for (const [d, v] of best!.assign) landed[d] = (landed[d] ?? 0) + v;
     }
+}
 
+/** A flow between two NAV observations belongs to that interval's ending NAV. */
+export function assignFlowLandingDays(nav: NavPoint[], flows: FlowPoint[]): Record<string, number> {
+    validateNav(nav);
+    const landed: Record<string, number> = {};
+    if (!nav.length) return landed;
+    for (const flow of flows) {
+        if (!isValidYmd(flow.date) || !Number.isFinite(flow.amount)) throw new Error('Neplatný externí peněžní tok.');
+        if (flow.date < nav[0].date || flow.date > nav[nav.length - 1].date) continue;
+        const day = nav.find(n => n.date >= flow.date)!.date;
+        landed[day] = (landed[day] ?? 0) + flow.amount;
+    }
     return landed;
 }
 
-/**
- * Práh, pod kterým se denní výnos nezapočítává.
- *
- * Když je na účtu pár tisíc korun, každý drobný pohyb je desítky procent a
- * řetězení takových dnů rozbije celou řadu (na reálných datech dělalo prázdné
- * období do ledna 2026 z ročního výnosu −37 %). 2 % historického maxima NAV
- * spolehlivě oddělí "účet reálně obchoduje" od "účet je prázdný".
- */
-export const MIN_NAV_FRACTION = 0.02;
-
+/** Inception cannot depend on a future account balance or hide small-account losses. */
 export function detectInception(nav: NavPoint[]): { inception: string; minNav: number } {
-    const peak = Math.max(...nav.map(n => n.nav), 0);
-    const minNav = peak * MIN_NAV_FRACTION;
-    const first = nav.find(n => n.nav >= minNav);
-    return { inception: first?.date ?? nav[0]?.date ?? '', minNav };
+    validateNav(nav);
+    return { inception: nav.find(n => n.nav > 0)?.date ?? nav[0]?.date ?? '', minNav: 0 };
 }
 
-/**
- * Spočítá kumulativní TWR index. `fxRate` (měna účtu → USD) se použije jen
- * v USD režimu; NAV i cash flows se převádí kurzem daného dne, takže výsledek
- * je výnos pohledem investora držícího dolary.
- */
+/** Missing exchange rates must never silently turn into a 1:1 conversion. */
+export function rateAt(fx: Record<string, number>, date: string): number {
+    const rate = fx[date];
+    if (!Number.isFinite(rate) || rate <= 0) throw new Error(`Chybí platný kurz USD k ${date}. Zapni Daily Conversion Rates ve Flex query.`);
+    return rate;
+}
+
 export function computeTwr(
     nav: NavPoint[],
     landedFlows: Record<string, number>,
-    opts: { minNav: number; fxToUsd?: Record<string, number> } // fxToUsd: kolik CZK za 1 USD
+    opts: { minNav?: number; fxToUsd?: Record<string, number> } = {},
 ): TwrPoint[] {
-    const { minNav, fxToUsd } = opts;
-    const convert = (date: string, v: number) => (fxToUsd ? v / (fxToUsd[date] || 1) : v);
-
+    validateNav(nav);
+    const convert = (date: string, value: number) => opts.fxToUsd ? value / rateAt(opts.fxToUsd, date) : value;
     const out: TwrPoint[] = [];
-    let acc = 1;
-
+    let index = 1;
     for (let i = 0; i < nav.length; i++) {
         const { date } = nav[i];
-        const flow = landedFlows[date] ?? 0;
+        const end = convert(date, nav[i].nav);
+        const flow = convert(date, landedFlows[date] ?? 0);
+        if (!Number.isFinite(flow)) throw new Error('Neplatný externí peněžní tok.');
         let stale = true;
-
         if (i > 0) {
-            const prev = nav[i - 1];
-            const begin = convert(prev.date, prev.nav);
-            const end = convert(date, nav[i].nav);
-            const f = convert(date, flow);
-            if (prev.nav >= minNav && begin > 0) {
-                acc *= (end - f) / begin;
-                stale = false;
+            const begin = convert(nav[i - 1].date, nav[i - 1].nav);
+            if (begin > 0) {
+                const factor = (end - flow) / begin;
+                // A non-positive capital base cannot support a conventional linked
+                // return. Keep it unavailable instead of resuming an invented index.
+                index = factor >= 0 ? index * factor : NaN;
+                stale = !Number.isFinite(index);
+            } else if (begin !== 0 || Math.abs(end - flow) > 1e-8) {
+                index = NaN;
             }
         }
-
-        out.push({
-            date,
-            index: acc,
-            nav: convert(date, nav[i].nav),
-            flow: convert(date, flow),
-            stale,
-        });
+        out.push({ date, index, nav: end, flow, stale });
     }
-
     return out;
 }
 
-/**
- * Pasivní protipól: kdyby každý vklad ve stejný den koupil benchmark, kolik by
- * dnes měl? Odpovídá na "vyplatil se mi aktivní trading" v penězích, ne v procentech.
- */
+/** Last observed value only; no look-ahead into a future price or FX quote. */
+export function valueOnOrBefore(values: Record<string, number>, date: string): number | undefined {
+    let found: string | undefined;
+    for (const day of Object.keys(values)) {
+        if (day <= date && (!found || day > found) && Number.isFinite(values[day]) && values[day] > 0) found = day;
+    }
+    return found ? values[found] : undefined;
+}
+
+/** Carry the USD price first, then apply each day's FX, including US holidays. */
+export function benchmarkInCurrency(
+    usdPrices: Record<string, number>, dates: string[], fx?: Record<string, number>,
+): Record<string, number> {
+    const result: Record<string, number> = {};
+    for (const date of dates) {
+        const price = valueOnOrBefore(usdPrices, date);
+        if (fx && !(fx[date] > 0)) continue;
+        if (price !== undefined) result[date] = price * (fx ? rateAt(fx, date) : 1);
+    }
+    return result;
+}
+
 export function simulatePassive(
-    flows: FlowPoint[],
-    benchmark: Record<string, number>,
-    dates: string[],
-    from: string,
-    startValue: number,
+    flows: FlowPoint[], benchmark: Record<string, number>, dates: string[], from: string, startValue: number,
 ): number {
-    const priceAt = (date: string) => {
-        // nejbližší dostupná cena k datu (dopředu i dozadu)
-        if (benchmark[date]) return benchmark[date];
-        const i = dates.indexOf(date);
-        for (let k = i; k >= 0; k--) if (benchmark[dates[k]]) return benchmark[dates[k]];
-        for (let k = i; k < dates.length; k++) if (benchmark[dates[k]]) return benchmark[dates[k]];
-        return NaN;
-    };
-
     const last = dates[dates.length - 1];
-    const endPrice = priceAt(last);
-    if (!Number.isFinite(endPrice)) return NaN;
-
-    let units = startValue / priceAt(from);
+    if (!last || !Number.isFinite(startValue) || startValue < 0) return NaN;
+    const startPrice = valueOnOrBefore(benchmark, from);
+    const endPrice = valueOnOrBefore(benchmark, last);
+    if (!startPrice || !endPrice) return NaN;
+    let units = startValue / startPrice;
     for (const f of flows) {
-        // Ostrá nerovnost: pohyb, který dopadl v den startu, je už započítaný
-        // v `startValue` (NAV toho dne). Jinak by se vklad počítal dvakrát.
         if (f.date <= from || f.date > last) continue;
-        const p = priceAt(f.date);
-        if (Number.isFinite(p) && p > 0) units += f.amount / p;
+        const price = valueOnOrBefore(benchmark, f.date);
+        if (!price || !Number.isFinite(f.amount)) return NaN;
+        units += f.amount / price;
+        // A buy-and-hold counterfactual cannot withdraw capital it doesn't own.
+        if (units < -1e-8) return NaN;
     }
     return units * endPrice;
+}
+
+/** Combine only complete, simultaneous observations; stale NAV invents returns. */
+export function mergeNavSeries<T extends {
+    accountIds: string[]; currency: string; nav: NavPoint[]; flows: FlowPoint[]; fxToUsd: Record<string, number>;
+}>(list: T[]): Pick<T, 'accountIds' | 'currency'> & {
+    nav: NavPoint[]; flows: FlowPoint[]; fxToUsd: Record<string, number>; fromDate: string; toDate: string;
+} {
+    if (!list.length) throw new Error('Chybí řady účtů.');
+    const seen = new Set<string>();
+    for (const series of list) {
+        validateNav(series.nav);
+        if (!series.nav.length) throw new Error('Některý účet nemá historii NAV.');
+        if (series.currency !== list[0].currency) throw new Error('Účty mají rozdílné bázové měny. Vyber jeden účet; jejich částky nelze přímo sčítat.');
+        for (const id of series.accountIds) {
+            if (seen.has(id)) throw new Error('Stejný IBKR účet je ve více Flex query. Vyber jednu query, aby se nezapočítal dvakrát.');
+            seen.add(id);
+        }
+    }
+    const maps = list.map(s => new Map(s.nav.map(n => [n.date, n.nav])));
+    const dates = list[0].nav.map(n => n.date).filter(date => maps.every(m => m.has(date)));
+    if (dates.length < 2) throw new Error('Účty nemají alespoň dvě společná data NAV.');
+    const flowByDate = new Map<string, number>();
+    const fxToUsd: Record<string, number> = {};
+    for (const series of list) {
+        for (const flow of series.flows) flowByDate.set(flow.date, (flowByDate.get(flow.date) ?? 0) + flow.amount);
+        for (const [date, rate] of Object.entries(series.fxToUsd)) {
+            if (fxToUsd[date] !== undefined && Math.abs(fxToUsd[date] - rate) > 1e-6 * Math.max(rate, fxToUsd[date])) {
+                throw new Error(`Účty obsahují různé směnné kurzy k ${date}.`);
+            }
+            fxToUsd[date] = rate;
+        }
+    }
+    return {
+        accountIds: [...seen], currency: list[0].currency,
+        fromDate: dates[0], toDate: dates[dates.length - 1],
+        nav: dates.map(date => ({ date, nav: maps.reduce((sum, m) => sum + m.get(date)!, 0) })),
+        flows: [...flowByDate].filter(([date]) => date >= dates[0] && date <= dates[dates.length - 1])
+            .map(([date, amount]) => ({ date, amount })).sort((a, b) => a.date.localeCompare(b.date)),
+        fxToUsd,
+    };
+}
+
+/** A passive holding ledger: contributions buy lots, withdrawals sell FIFO. */
+export function simulatePassiveLedger(opts: {
+    flows: FlowPoint[];
+    prices: Record<string, number>;
+    dividends: Record<string, number>;
+    fxToBase: Record<string, number>;
+    from: string;
+    to: string;
+    startValue: number;
+    dividendRate: number;
+    liquidate: boolean;
+}): {
+    value: number;
+    dividendIncomeByYear: Record<string, number>;
+    trades: { date: string; assetCategory: string; pnl: number; proceeds: number; holdingDays: number; acquiredDate: string }[];
+} | null {
+    const priceAt = (date: string) => {
+        const usd = valueOnOrBefore(opts.prices, date);
+        const fx = valueOnOrBefore(opts.fxToBase, date);
+        return usd && fx ? usd * fx : undefined;
+    };
+    const startPrice = priceAt(opts.from);
+    const lastPrice = priceAt(opts.to);
+    if (!startPrice || !lastPrice || !Number.isFinite(opts.startValue) || opts.startValue < 0) return null;
+    const lots = [{ date: opts.from, units: opts.startValue / startPrice, costPerUnit: startPrice }];
+    const trades: { date: string; assetCategory: string; pnl: number; proceeds: number; holdingDays: number; acquiredDate: string }[] = [];
+    const dividendIncomeByYear: Record<string, number> = {};
+    const flows = new Map<string, number>();
+    for (const flow of opts.flows) flows.set(flow.date, (flows.get(flow.date) ?? 0) + flow.amount);
+    const dates = [...new Set([...Object.keys(opts.prices), ...Object.keys(opts.dividends), ...flows.keys(), opts.to])]
+        .filter(date => date > opts.from && date <= opts.to).sort();
+    const sell = (date: string, amount: number, price: number): boolean => {
+        let remaining = amount / price;
+        for (const lot of lots) {
+            const units = Math.min(lot.units, remaining);
+            if (units <= 1e-10) continue;
+            const d1 = Date.UTC(+lot.date.slice(0, 4), +lot.date.slice(4, 6) - 1, +lot.date.slice(6, 8));
+            const d2 = Date.UTC(+date.slice(0, 4), +date.slice(4, 6) - 1, +date.slice(6, 8));
+            trades.push({ date, assetCategory: 'STK', pnl: units * (price - lot.costPerUnit), proceeds: units * price, holdingDays: (d2 - d1) / 86400000, acquiredDate: lot.date });
+            lot.units -= units;
+            remaining -= units;
+        }
+        return remaining <= 1e-8;
+    };
+    for (const date of dates) {
+        const price = priceAt(date);
+        const fx = valueOnOrBefore(opts.fxToBase, date);
+        if (!price || !fx) return null;
+        const dividend = opts.dividends[date] ?? 0;
+        if (dividend) {
+            const income = lots.reduce((sum, lot) => sum + lot.units, 0) * dividend * fx;
+            const year = date.slice(0, 4);
+            dividendIncomeByYear[year] = (dividendIncomeByYear[year] ?? 0) + income;
+            const net = income * (1 - opts.dividendRate);
+            lots.push({ date, units: net / price, costPerUnit: price });
+        }
+        const amount = flows.get(date) ?? 0;
+        if (amount >= 0) lots.push({ date, units: amount / price, costPerUnit: price });
+        else if (!sell(date, -amount, price)) return null;
+    }
+    const value = lots.reduce((sum, lot) => sum + lot.units, 0) * lastPrice;
+    if (opts.liquidate && !sell(opts.to, value, lastPrice)) return null;
+    return { value, dividendIncomeByYear, trades };
 }

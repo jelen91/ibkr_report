@@ -13,8 +13,8 @@ export default function CredentialsForm({ onConnect, loading, compact }: Credent
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault();
-        if (token && queryId) {
-            onConnect(name || 'Účet', token, queryId);
+        if (token.trim() && queryId.trim()) {
+            onConnect(name.trim() || 'Účet', token.trim(), queryId.trim());
         }
     };
 

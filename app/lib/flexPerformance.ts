@@ -9,8 +9,8 @@ import { XMLParser } from 'fast-xml-parser';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import type { NavPoint, FlowPoint } from './twr';
-import type { TaxInputs, RealizedTrade, CashItem } from './tax';
+import { isValidYmd, mergeNavSeries, type NavPoint, type FlowPoint } from './twr';
+import type { TaxInputs, RealizedTrade } from './tax';
 
 const SEND_URL = 'https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest';
 const PICKUP_URL = 'https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement';
@@ -28,13 +28,14 @@ const EXTERNAL_FLOW_CODES = new Set(['DEP', 'WITH']);
 // vstoupily do základu dvakrát.
 const TAX_TRADE_LEVEL = 'EXECUTION';
 
+const CACHE_SCHEMA_VERSION = 3;
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const CACHE_DIR = path.join(process.cwd(), 'data');
 
 const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: '',
-    parseAttributeValue: true,
+    parseAttributeValue: false,
 });
 
 export interface PerformanceSeries {
@@ -47,6 +48,8 @@ export interface PerformanceSeries {
     fxToUsd: Record<string, number>;     // YYYYMMDD → kolik bázové měny za 1 USD
     tax: TaxInputs;                      // podklady pro odhad daně
     fetchedAt: number;
+    schemaVersion: number;
+    warnings: string[];
 }
 
 const memCache = new Map<string, { at: number; data: PerformanceSeries }>();
@@ -60,7 +63,8 @@ function readDiskCache(key: string): PerformanceSeries | null {
         const file = path.join(CACHE_DIR, `perf-${key}.json`);
         const raw = fs.readFileSync(file, 'utf-8');
         const data: PerformanceSeries = JSON.parse(raw);
-        if (Date.now() - data.fetchedAt > CACHE_TTL_MS) return null;
+        if (data.schemaVersion !== CACHE_SCHEMA_VERSION || !Number.isFinite(data.fetchedAt)
+            || data.fetchedAt > Date.now() || Date.now() - data.fetchedAt > CACHE_TTL_MS) return null;
         return data;
     } catch {
         return null;
@@ -120,7 +124,7 @@ async function fetchFlexStatements(token: string, queryId: string): Promise<any[
     // 1) Vyžádání reportu
     let referenceCode: string | number | undefined;
     for (let attempt = 1; attempt <= 3; attempt++) {
-        const res = await axios.get(SEND_URL, { params: { t: token, q: queryId, v: '3' }, headers });
+        const res = await axios.get(SEND_URL, { params: { t: token, q: queryId, v: '3' }, headers, timeout: 30000 });
         const root = parser.parse(res.data).FlexStatementResponse ?? parser.parse(res.data);
 
         if (root.Status !== 'Fail') {
@@ -144,6 +148,7 @@ async function fetchFlexStatements(token: string, queryId: string): Promise<any[
             const res = await axios.get(PICKUP_URL, {
                 params: { t: token, q: referenceCode, v: '3' },
                 headers,
+                timeout: 30000,
             });
             const parsed = parser.parse(res.data);
             const report = parsed.FlexQueryResponse;
@@ -154,11 +159,11 @@ async function fetchFlexStatements(token: string, queryId: string): Promise<any[
             }
             const root = parsed.FlexStatementResponse;
             if (root?.Status === 'Fail' && !RETRYABLE_CODES.has(Number(root.ErrorCode))) {
-                throw new Error(String(root.ErrorMessage));
+                throw new Error(`FlexStatement: ${String(root.ErrorMessage)}`);
             }
         } catch (err) {
             if (err instanceof Error && err.message.includes('FlexStatement')) throw err;
-            console.error('Chyba při vyzvedávání reportu:', err);
+            console.error('Chyba při vyzvedávání reportu:', err instanceof Error ? err.message : 'Neznámá chyba');
         }
     }
 
@@ -170,224 +175,304 @@ async function fetchFlexStatements(token: string, queryId: string): Promise<any[
  * se sečte po dnech — TWR se pak počítá nad jejich součtem, což je správně
  * (portfolio jako celek), na rozdíl od průměrování výnosů jednotlivých účtů.
  */
+function flexDate(value: unknown, context: string): string {
+    const date = String(value ?? '').split(';')[0].replaceAll('-', '');
+    const today = new Date().toISOString().slice(0, 10).replaceAll('-', '');
+    if (!isValidYmd(date) || date > today) throw new Error(`Neplatné nebo budoucí datum v ${context}.`);
+    return date;
+}
+
+function requiredNumber(value: unknown, context: string): number {
+    if (value === undefined || value === null || String(value).trim() === '' || !Number.isFinite(Number(value))) {
+        throw new Error(`Chybí platná částka v ${context}.`);
+    }
+    return Number(value);
+}
+
 export function extractSeries(statements: any[]): PerformanceSeries {
-    const navByDate = new Map<string, number>();
-    const flowByDate = new Map<string, number>();
-    const fxToUsd: Record<string, number> = {};
-    const accountIds: string[] = [];
-
-    const tax: TaxInputs = {
-        trades: [],
-        unrealized: [],
-        dividends: [],
-        dividendWithheld: [],
-        interest: [],
-        interestWithheld: [],
-    };
-
-    let currency = 'CZK';
-    let fromDate = '';
-    let toDate = '';
-
+    if (!statements.length) throw new Error('Report neobsahuje účty.');
+    const accounts = new Map<string, any[]>();
+    const warnings = new Set<string>();
     for (const stmt of statements) {
-        if (stmt.accountId) accountIds.push(String(stmt.accountId));
-        if (stmt.fromDate && (!fromDate || String(stmt.fromDate) < fromDate)) fromDate = String(stmt.fromDate);
-        if (stmt.toDate && (!toDate || String(stmt.toDate) > toDate)) toDate = String(stmt.toDate);
+        const accountId = String(stmt.accountId ?? '');
+        if (!accountId) throw new Error('Report neobsahuje identifikátor účtu.');
+        accounts.set(accountId, [...(accounts.get(accountId) ?? []), stmt]);
+    }
+    const extracted: PerformanceSeries[] = [];
+    for (const [accountId, accountStatements] of accounts) {
+        const navByDate = new Map<string, number>();
+        const flowByDate = new Map<string, number>();
+        const fxToUsd: Record<string, number> = {};
+        const tax: TaxInputs = { trades: [], unrealized: [], dividends: [], dividendWithheld: [], interest: [], interestWithheld: [] };
+        const currencies = new Set<string>();
+        const seenRows = new Map<string, string>();
+        const trades: any[] = [];
+        let latestPositionDate = '';
+        let positions: any[] = [];
 
-        // --- denní NAV ---
-        for (const row of asArray<any>(stmt.EquitySummaryInBase?.EquitySummaryByReportDateInBase)) {
-            const date = String(row.reportDate ?? '');
-            const total = Number(row.total);
-            if (!date || !Number.isFinite(total)) continue;
-            navByDate.set(date, (navByDate.get(date) ?? 0) + total);
-            if (row.currency) currency = String(row.currency);
-        }
-
-        // --- vklady, výběry a položky §8 (dividendy, úroky, sražená daň) ---
-        for (const row of asArray<any>(stmt.StmtFunds?.StatementOfFundsLine)) {
-            if (String(row.levelOfDetail) !== 'BaseCurrency') continue;
-            const date = String(row.date ?? '');
-            const amount = Number(row.amount);
-            if (!date || !Number.isFinite(amount)) continue;
-            const code = String(row.activityCode);
-
-            if (EXTERNAL_FLOW_CODES.has(code)) {
-                flowByDate.set(date, (flowByDate.get(date) ?? 0) + amount);
-                continue;
-            }
-
-            const item: CashItem = { date, amount };
-            if (code === 'DIV') tax.dividends.push(item);
-            else if (code === 'CINT' || code === 'DINT') tax.interest.push(item);
-            else if (code === 'FRTAX') {
-                // IBKR srazí 20 % i z připsaných úroků, nejen z dividend. Rozliší
-                // se to podle toho, jestli je řádek navázaný na konkrétní titul.
-                // (Storno páry se sečtou samy — pracuje se se součtem, ne s jednotlivými řádky.)
-                if (row.symbol) tax.dividendWithheld.push(item);
-                else tax.interestWithheld.push(item);
-            }
-        }
-
-        // --- realizované obchody pro §10 ---
-        tax.trades.push(...extractRealizedTrades(stmt));
-
-        // --- otevřené pozice pro scénář likvidace ---
-        for (const pos of asArray<any>(stmt.OpenPositions?.OpenPosition)) {
-            if (String(pos.levelOfDetail ?? '').toUpperCase() !== 'SUMMARY') continue;
-            const fx = Number(pos.fxRateToBase ?? 1);
-            const pnl = Number(pos.fifoPnlUnrealized ?? 0) * fx;
-            if (!Number.isFinite(pnl) || pnl === 0) continue;
-            const value = Number(pos.positionValue ?? 0) * fx;
-            tax.unrealized.push({
-                date: String(pos.reportDate ?? ''),
-                assetCategory: String(pos.assetCategory ?? ''),
-                pnl,
-                proceeds: value > 0 ? value : 0,
-                // I OpenPositions má u tohoto účtu prázdné openDateTime, takže
-                // časový test u otevřených pozic ověřit nejde → zdanitelné.
-                holdingDays: null,
+        // Repeated query periods must not duplicate an account's transactions.
+        // Keep identical, ID-less rows within one statement: two equal deposits
+        // can be real. Across overlapping statements preserve their multiplicity.
+        const occurrenceCounts = new Map<string, number>();
+        function uniqueRows(stmt: any, section: string, item: string, accept?: (row: any) => boolean): any[] {
+            const inStatement = new Map<string, number>();
+            return asArray<any>(stmt[section]?.[item]).filter(row => {
+                if (accept && !accept(row)) return false;
+                const id = row.transactionID || row.tradeID;
+                const serialized = JSON.stringify(Object.fromEntries(Object.entries(row).sort(([a], [b]) => a.localeCompare(b))));
+                if (id) {
+                    const key = `${section}:${id}:${row.levelOfDetail ?? ''}`;
+                    const prior = seenRows.get(key);
+                    if (prior && prior !== serialized) throw new Error('Překrývající se výpisy obsahují rozdílné údaje stejné transakce.');
+                    if (prior) return false;
+                    seenRows.set(key, serialized);
+                    return true;
+                }
+                const key = `${section}:${serialized}`;
+                const occurrence = (inStatement.get(key) ?? 0) + 1;
+                inStatement.set(key, occurrence);
+                const prior = occurrenceCounts.get(key) ?? 0;
+                if (occurrence <= prior) return false;
+                occurrenceCounts.set(key, occurrence);
+                return true;
             });
         }
 
-        // --- denní kurz USD → bázová měna (přímo od IBKR, tedy stejný, jakým
-        //     přeceňuje NAV; externí FX zdroj by zaváděl vlastní odchylku) ---
-        for (const row of asArray<any>(stmt.ConversionRates?.ConversionRate)) {
-            if (String(row.fromCurrency) !== 'USD') continue;
-            if (String(row.toCurrency) !== currency) continue;
-            const date = String(row.reportDate ?? '');
-            const rate = Number(row.rate);
-            if (date && Number.isFinite(rate) && rate > 0) fxToUsd[date] = rate;
+        for (const stmt of accountStatements) {
+            if (stmt.fromDate) flexDate(stmt.fromDate, 'počátku výpisu');
+            if (stmt.toDate) flexDate(stmt.toDate, 'konci výpisu');
+            for (const value of [stmt.currency, stmt.AccountInformation?.currency]) {
+                if (value && value !== 'BASE_SUMMARY') currencies.add(String(value));
+            }
+            const rows = asArray<any>(stmt.EquitySummaryInBase?.EquitySummaryByReportDateInBase);
+            const consolidatedDates = new Set(rows.filter(row => !row.model).map(row => String(row.reportDate)));
+            for (const row of rows) {
+                if (row.model) {
+                    if (consolidatedDates.has(String(row.reportDate))) continue;
+                    throw new Error('NAV obsahuje jen modelové podúčty. Zapni souhrn NAV za celý účet.');
+                }
+                if (row.accountId && String(row.accountId) !== accountId) throw new Error('Nesouhlasí identifikátor účtu v NAV.');
+                const date = flexDate(row.reportDate, 'NAV');
+                const total = requiredNumber(row.total, 'NAV');
+                if (row.currency && row.currency !== 'BASE_SUMMARY') currencies.add(String(row.currency));
+                const prior = navByDate.get(date);
+                if (prior !== undefined && Math.abs(prior - total) > 1e-8) throw new Error(`Výpisy obsahují rozdílné NAV k ${date}.`);
+                navByDate.set(date, total);
+            }
+            if (stmt.StmtFunds === undefined) throw new Error('Ve Flex query chybí Statement of Funds; bez vkladů a výběrů nelze výnos ověřit.');
+            const funds = uniqueRows(stmt, 'StmtFunds', 'StatementOfFundsLine');
+            const cashRows = funds.filter(row => String(row.levelOfDetail) === 'BaseCurrency');
+            if (funds.length && !cashRows.length) throw new Error('Statement of Funds neobsahuje úroveň BaseCurrency.');
+            for (const row of cashRows) {
+                const code = String(row.activityCode);
+                // Opening/closing balances are not dated transactions.
+                if (!EXTERNAL_FLOW_CODES.has(code) && !['DIV', 'PIL', 'CINT', 'DINT', 'INTR', 'INTP', 'FRTAX', 'REC', 'DEL'].includes(code)) continue;
+                const date = flexDate(row.date, 'Statement of Funds');
+                const amount = requiredNumber(row.amount, 'Statement of Funds');
+                if (EXTERNAL_FLOW_CODES.has(code)) {
+                    // reportDate is the NAV accounting date; date/settleDate can
+                    // precede it (confirmed on the broker's delayed deposits).
+                    const booked = row.reportDate ? flexDate(row.reportDate, 'zaúčtování vkladu/výběru') : date;
+                    flowByDate.set(booked, (flowByDate.get(booked) ?? 0) + amount);
+                }
+                else if (code === 'DIV' || code === 'PIL') tax.dividends.push({ date, amount });
+                else if (['CINT', 'DINT', 'INTR', 'INTP'].includes(code)) tax.interest.push({ date, amount, kind: ['DINT', 'INTP'].includes(code) ? 'expense' : 'income' });
+                else if (code === 'FRTAX') {
+                    (row.symbol ? tax.dividendWithheld : tax.interestWithheld).push({ date, amount });
+                } else if (stmt.Transfers === undefined) {
+                    throw new Error('Výpis obsahuje převod cenných papírů. Zapni sekci Transfers včetně Position Amount in Base.');
+                }
+            }
+            if (stmt.Transfers === undefined) warnings.add('Flex query neobsahuje sekci Transfers. Výnos předpokládá, že neproběhly převody cenných papírů mezi brokery.');
+            for (const row of uniqueRows(stmt, 'Transfers', 'Transfer')) {
+                if (String(row.assetCategory) === 'CASH') continue; // already in DEP/WITH
+                const date = flexDate(row.date ?? row.reportDate, 'převodu cenných papírů');
+                const amount = requiredNumber(row.positionAmountInBase, 'hodnotě převodu cenných papírů');
+                const direction = String(row.direction).toUpperCase();
+                if (!['IN', 'OUT'].includes(direction)) throw new Error('Převod cenných papírů nemá platný směr IN/OUT.');
+                const value = direction === 'IN' ? Math.abs(amount) : -Math.abs(amount);
+                flowByDate.set(date, (flowByDate.get(date) ?? 0) + value);
+            }
+            if (stmt.Trades === undefined) warnings.add('Chybí sekce Trades; odhad daně nezahrnuje realizované obchody.');
+            if (stmt.OpenPositions === undefined) warnings.add('Chybí sekce Open Positions; nelze modelovat daň při likvidaci.');
+            // Order summaries and closed lots describe the same executions.
+            // Multiple closed lots can share a trade ID, so do not even run
+            // execution deduplication on these unused levels.
+            trades.push(...uniqueRows(stmt, 'Trades', 'Trade',
+                row => String(row.levelOfDetail).toUpperCase() === TAX_TRADE_LEVEL));
+            const snapshotDate = stmt.toDate ? flexDate(stmt.toDate, 'pozicích') : '';
+            if (snapshotDate >= latestPositionDate) {
+                latestPositionDate = snapshotDate;
+                positions = asArray<any>(stmt.OpenPositions?.OpenPosition);
+            }
+            for (const row of asArray<any>(stmt.ConversionRates?.ConversionRate)) {
+                if (String(row.fromCurrency) !== 'USD') continue;
+                // Currency is validated after all NAV rows have been inspected.
+                const target = String(row.toCurrency ?? '');
+                if (currencies.size === 1 && !currencies.has(target)) continue;
+                const date = flexDate(row.reportDate, 'směnných kurzech');
+                const rate = requiredNumber(row.rate, 'směnných kurzech');
+                if (rate <= 0) throw new Error('Směnný kurz musí být kladný.');
+                if (fxToUsd[date] !== undefined && Math.abs(fxToUsd[date] - rate) > 1e-6 * rate) throw new Error(`Rozdílné směnné kurzy k ${date}.`);
+                fxToUsd[date] = rate;
+            }
         }
+        if (currencies.size !== 1) throw new Error('Bázová měna účtu chybí nebo se v období změnila. Takové částky nelze přímo sčítat.');
+        const currency = [...currencies][0];
+        const nav: NavPoint[] = [...navByDate].map(([date, nav]) => ({ date, nav })).sort((a, b) => a.date.localeCompare(b.date));
+        if (!nav.length) throw new Error('Flex query neobsahuje denní NAV.');
+        if (currency === 'USD') for (const row of nav) fxToUsd[row.date] = 1;
+        fillFxGaps(fxToUsd, nav.map(n => n.date));
+        if (nav.some(n => !fxToUsd[n.date])) warnings.add('Chybí některé kurzy USD. Přepočet do USD a srovnání s americkým benchmarkem nejsou pro celé období dostupné.');
+        tax.trades = extractRealizedTrades({ AccountInformation: { currency }, Trades: { Trade: trades } });
+        tax.unrealized = extractUnrealizedPositions(positions, currency, latestPositionDate);
+        extracted.push({
+            accountIds: [accountId], currency, fromDate: nav[0].date, toDate: nav[nav.length - 1].date,
+            nav, flows: [...flowByDate].map(([date, amount]) => ({ date, amount })).sort((a, b) => a.date.localeCompare(b.date)),
+            fxToUsd, tax, fetchedAt: Date.now(), schemaVersion: CACHE_SCHEMA_VERSION, warnings: [],
+        });
     }
-
-    const nav: NavPoint[] = [...navByDate.entries()]
-        .map(([date, v]) => ({ date, nav: v }))
-        .sort((a, b) => a.date.localeCompare(b.date));
-
-    const flows: FlowPoint[] = [...flowByDate.entries()]
-        .map(([date, amount]) => ({ date, amount }))
-        .sort((a, b) => a.date.localeCompare(b.date));
-
-    // Kurzy nejsou na všechny dny (svátky, první den mimo rozsah query) → dorovnat
-    // posledním známým, případně prvním dopředu.
-    fillFxGaps(fxToUsd, nav.map(n => n.date));
-
-    tax.trades.sort((a, b) => a.date.localeCompare(b.date));
-
-    return {
-        accountIds,
-        currency,
-        fromDate,
-        toDate,
-        nav,
-        flows,
-        fxToUsd,
-        tax,
-        fetchedAt: Date.now(),
+    const merged = extracted.length === 1 ? extracted[0] : {
+        ...extracted[0], ...mergeNavSeries(extracted), tax: {
+            trades: extracted.flatMap(s => s.tax.trades), unrealized: extracted.flatMap(s => s.tax.unrealized),
+            dividends: extracted.flatMap(s => s.tax.dividends), dividendWithheld: extracted.flatMap(s => s.tax.dividendWithheld),
+            interest: extracted.flatMap(s => s.tax.interest), interestWithheld: extracted.flatMap(s => s.tax.interestWithheld),
+        },
     };
+    // Open-position snapshots must retain their original date so a liquidation
+    // comparison can reject a valuation that differs from the common NAV date.
+    for (const key of ['trades', 'dividends', 'dividendWithheld', 'interest', 'interestWithheld'] as const) {
+        // The tax horizon cannot run past the latest shared NAV observation.
+        (merged.tax[key] as { date: string }[]) = merged.tax[key].filter(item => item.date <= merged.toDate);
+    }
+    return { ...merged, warnings: [...warnings] };
 }
 
 /**
- * Realizované obchody s dopočítanou dobou držení.
+ * P/L bereme jednou z EXECUTION. Hrubé příjmy zahrnují i otevírací prodeje
+ * (například vypsané opce); nákup zavírající short není další příjem.
  *
- * IBKR má ve flexu pole `openDateTime` i `holdingPeriodDateTime`, jenže u tohohle
- * účtu přicházejí prázdná (u všech 142 uzavíracích obchodů), takže časový test
- * z nich přečíst nejde. Doba držení se proto rekonstruuje FIFO párováním
- * otevíracích a uzavíracích obchodů v rámci staženého období — což pokrývá
- * všechno, co se otevřelo i zavřelo uvnitř okna.
- *
- * Co se spárovat nepodaří (pozice otevřená před začátkem období), dostane
- * `holdingDays: null` a v daňovém modelu se počítá jako zdanitelné. To je
- * konzervativní směr: raději daň nadhodnotit než tvrdit osvobození, které
- * z dat neplyne.
+ * Doba držení musí pocházet z brokerova data nabytí. FIFO rekonstrukce pouze
+ * uvnitř okna reportu nemůže vyloučit starší počáteční loty a vážený průměr
+ * stáří nedokáže rozhodnout o osvobození jednotlivých lotů. Když datum chybí,
+ * necháme je neznámé. Brokerovo P/L zůstává orientačním daňovým podkladem.
  */
-function extractRealizedTrades(stmt: any): RealizedTrade[] {
-    const rows = asArray<any>(stmt.Trades?.Trade)
-        .filter(t => String(t.levelOfDetail) === TAX_TRADE_LEVEL)
-        .map(t => ({
-            date: String(t.tradeDate ?? ''),
-            dateTime: String(t.dateTime ?? ''),
-            conid: String(t.conid ?? ''),
-            assetCategory: String(t.assetCategory ?? ''),
-            quantity: Number(t.quantity ?? 0),
-            proceeds: Number(t.proceeds ?? 0) * Number(t.fxRateToBase ?? 1),
-            pnl: Number(t.fifoPnlRealized ?? 0) * Number(t.fxRateToBase ?? 1),
-            openClose: String(t.openCloseIndicator ?? ''),
-        }))
-        .filter(t => t.date)
-        .sort((a, b) => (a.date + a.dateTime).localeCompare(b.date + b.dateTime));
-
-    // Otevřené loty na instrument: [den otevření, zbývající množství]
-    const lots = new Map<string, { date: string; qty: number }[]>();
+export function extractRealizedTrades(stmt: any): RealizedTrade[] {
+    const baseCurrency = String(stmt.AccountInformation?.currency ?? stmt.currency ??
+        asArray<any>(stmt.EquitySummaryInBase?.EquitySummaryByReportDateInBase)[0]?.currency ?? '');
+    const compactDate = (value: unknown) => String(value ?? '').replace(/-/g, '').slice(0, 8);
     const out: RealizedTrade[] = [];
+    for (const row of asArray<any>(stmt.Trades?.Trade)) {
+        if (String(row.levelOfDetail).toUpperCase() !== TAX_TRADE_LEVEL) continue;
+        const date = compactDate(row.tradeDate ?? row.dateTime);
+        if (!Number.isFinite(daysBetween(date, date))) throw new Error('Obchod nemá platné datum.');
+        const rawFx = row.fxRateToBase;
+        const fx = baseCurrency && String(row.currency) === baseCurrency ? 1
+            : rawFx !== undefined && rawFx !== '' ? Number(rawFx) : NaN;
+        if (!Number.isFinite(fx) || fx <= 0) throw new Error('U obchodu chybí kurz do bázové měny.');
+        const isClose = String(row.openCloseIndicator ?? '').toUpperCase().includes('C');
+        const rawPnl = row.fifoPnlRealized;
+        if (isClose && (rawPnl === undefined || rawPnl === '')) throw new Error('Uzavírací obchod nemá realizované P/L.');
+        const pnl = Number(rawPnl ?? 0) * fx;
+        const rawProceeds = row.proceeds;
+        if (rawProceeds === undefined || rawProceeds === '') throw new Error('U obchodu chybí hrubý příjem / výdaj.');
+        const proceeds = Number(rawProceeds) * fx;
+        const quantity = Number(row.quantity);
+        if (![pnl, proceeds, quantity].every(Number.isFinite)) throw new Error('Obchod obsahuje neplatnou číselnou hodnotu.');
+        if (!isClose && pnl === 0 && proceeds <= 0) continue;
+        const acquired = compactDate(row.openDateTime);
+        const holding = daysBetween(acquired, date);
+        // Short nikdy nedostane časové osvobození jen podle doby mezi prodejem a nákupem.
+        const short = (isClose && quantity > 0) || (!isClose && proceeds > 0);
+        out.push({ date, assetCategory: String(row.assetCategory ?? ''), pnl,
+            proceeds: Math.max(0, proceeds),
+            holdingDays: !short && Number.isFinite(holding) && holding >= 0 ? holding : null,
+            ...(!short && Number.isFinite(holding) && holding >= 0 ? { acquiredDate: acquired } : {}),
+            ...(short ? { exemptionEligible: false } : {}),
+        });
+    }
+    return out.sort((a, b) => a.date.localeCompare(b.date));
+}
 
-    for (const t of rows) {
-        const isOpen = t.openClose.includes('O');
-        const isClose = t.openClose.includes('C');
-
-        if (isClose) {
-            const queue = lots.get(t.conid) ?? [];
-            let remaining = Math.abs(t.quantity);
-            let matched = 0;
-            let weightedDays = 0;
-
-            while (remaining > 1e-9 && queue.length > 0) {
-                const lot = queue[0];
-                const take = Math.min(remaining, Math.abs(lot.qty));
-                weightedDays += daysBetween(lot.date, t.date) * take;
-                matched += take;
-                remaining -= take;
-                lot.qty = lot.qty > 0 ? lot.qty - take : lot.qty + take;
-                if (Math.abs(lot.qty) < 1e-9) queue.shift();
+/**
+ * Lots carry acquisition dates; SUMMARY does not establish the age of each
+ * holding. Use a complete, reconciled lot breakdown instead of its summary,
+ * never both. An incomplete breakdown must not silently lower liquidation tax.
+ * https://www.ibkrguides.com/reportingreference/reportguide/open%20positionsfq.htm
+ */
+export function extractUnrealizedPositions(positions: any[], currency: string, snapshotDate: string): RealizedTrade[] {
+    const groups = new Map<string, { summary: any[]; lots: any[] }>();
+    for (const row of positions) {
+        const level = String(row.levelOfDetail).toUpperCase();
+        if (level !== 'SUMMARY' && level !== 'LOT') continue;
+        const instrument = row.conid || (row.symbol && JSON.stringify([row.symbol,
+            row.expiry ?? '', Number(row.strike) || '', row.putCall ?? '']));
+        if (!instrument) throw new Error('Otevřená pozice nemá identifikátor instrumentu.');
+        const side = Number(row.position ?? row.quantity) < 0 ? 'SHORT' : 'LONG';
+        const key = JSON.stringify([row.accountId ?? '', row.model ?? '', row.currency ?? '',
+            row.assetCategory ?? '', instrument, side]);
+        const group = groups.get(key) ?? { summary: [], lots: [] };
+        group[level === 'LOT' ? 'lots' : 'summary'].push(row);
+        groups.set(key, group);
+    }
+    const amounts = (row: any) => {
+        const rate = row.currency === currency ? 1 : requiredNumber(row.fxRateToBase, 'kurzu otevřené pozice');
+        if (rate <= 0) throw new Error('Neplatný kurz otevřené pozice.');
+        return {
+            quantity: requiredNumber(row.position ?? row.quantity, 'množství otevřené pozice'),
+            pnl: requiredNumber(row.fifoPnlUnrealized, 'nerealizovaném zisku') * rate,
+            value: requiredNumber(row.positionValue, 'hodnotě otevřené pozice') * rate,
+        };
+    };
+    const out: RealizedTrade[] = [];
+    for (const group of groups.values()) {
+        if (group.summary.length > 1) throw new Error('Otevřené pozice obsahují více souhrnů stejného instrumentu.');
+        if (group.summary.length && group.lots.length) {
+            const total = amounts(group.summary[0]);
+            const sum = group.lots.map(amounts).reduce((s, row) => ({
+                quantity: s.quantity + row.quantity, pnl: s.pnl + row.pnl, value: s.value + row.value,
+            }), { quantity: 0, pnl: 0, value: 0 });
+            const tolerance = 0.01 * Math.max(1, group.lots.length);
+            if (Math.abs(sum.quantity - total.quantity) > 1e-8 || Math.abs(sum.pnl - total.pnl) > tolerance ||
+                Math.abs(sum.value - total.value) > tolerance) {
+                throw new Error('Loty otevřené pozice nesouhlasí se souhrnem; nelze ověřit daň při likvidaci.');
             }
-
-            const total = Math.abs(t.quantity);
-            // Doba držení je vážený průměr napárovaných lotů; když se nepodařilo
-            // dohledat všechno, je celý obchod raději bez známé doby držení.
-            const holdingDays =
-                matched > 0 && remaining <= 1e-9 ? Math.round(weightedDays / matched) : null;
-
-            out.push({
-                date: t.date,
-                assetCategory: t.assetCategory,
-                pnl: t.pnl,
-                // Do hodnotového testu jde hrubý příjem z prodeje, tedy jen
-                // uzavírky prodejem (u short pozic se pozice zavírá nákupem).
-                proceeds: t.quantity < 0 ? Math.abs(t.proceeds) : 0,
-                holdingDays,
-            });
-
-            if (queue.length === 0) lots.delete(t.conid);
-            else lots.set(t.conid, queue);
         }
-
-        if (isOpen) {
-            const queue = lots.get(t.conid) ?? [];
-            queue.push({ date: t.date, qty: t.quantity });
-            lots.set(t.conid, queue);
+        for (const row of group.lots.length ? group.lots : group.summary) {
+            const { quantity, pnl, value } = amounts(row);
+            if (quantity === 0 && pnl === 0 && value === 0) continue;
+            const date = flexDate(row.reportDate || snapshotDate, 'otevřené pozici');
+            const acquired = String(row.openDateTime ?? '').replaceAll('-', '').slice(0, 8);
+            const holding = daysBetween(acquired, date);
+            const short = quantity < 0 || value < 0 || String(row.side).toUpperCase() === 'SHORT';
+            const knownHolding = !short && String(row.levelOfDetail).toUpperCase() === 'LOT' &&
+                Number.isFinite(holding) && holding >= 0;
+            out.push({ date, assetCategory: String(row.assetCategory ?? ''), pnl, proceeds: Math.max(0, value),
+                holdingDays: knownHolding ? holding : null,
+                ...(knownHolding ? { acquiredDate: acquired } : {}),
+                ...(short ? { exemptionEligible: false } : {}),
+            });
         }
     }
-
     return out;
 }
 
 function daysBetween(from: string, to: string): number {
-    const a = Date.UTC(+from.slice(0, 4), +from.slice(4, 6) - 1, +from.slice(6, 8));
-    const b = Date.UTC(+to.slice(0, 4), +to.slice(4, 6) - 1, +to.slice(6, 8));
-    return Math.round((b - a) / 86400000);
+    const parse = (value: string) => {
+        if (!/^\d{8}$/.test(value)) return NaN;
+        const date = new Date(Date.UTC(+value.slice(0, 4), +value.slice(4, 6) - 1, +value.slice(6, 8)));
+        return date.toISOString().slice(0, 10).replace(/-/g, '') === value ? date.getTime() : NaN;
+    };
+    return (parse(to) - parse(from)) / 86400000;
 }
 
 function fillFxGaps(fx: Record<string, number>, dates: string[]) {
-    let last = 0;
-    for (const d of dates) {
-        if (fx[d]) last = fx[d];
-        else if (last) fx[d] = last;
-    }
-    // dny před prvním známým kurzem
-    const firstKnown = dates.find(d => fx[d]);
-    if (!firstKnown) return;
-    for (const d of dates) {
-        if (d >= firstKnown) break;
-        fx[d] = fx[firstKnown];
+    // Include rates on dates without NAV, and never borrow from the future.
+    const rateDates = Object.keys(fx).sort();
+    let i = 0;
+    let last: number | undefined;
+    for (const date of dates) {
+        while (i < rateDates.length && rateDates[i] <= date) last = fx[rateDates[i++]];
+        if (!fx[date] && last !== undefined) fx[date] = last;
     }
 }

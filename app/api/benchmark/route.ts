@@ -1,4 +1,5 @@
 import { NextResponse, NextRequest } from 'next/server';
+import { isValidYmd } from '@/app/lib/twr';
 
 // Benchmark ve flex query není — IBKR reportuje jen to, co skutečně držíš.
 // Bere se tedy zvenčí. Volá se ze serveru, protože Yahoo neposílá CORS hlavičky.
@@ -12,6 +13,9 @@ const CACHE_TTL_MS = 60 * 60 * 1000;
 
 interface BenchmarkPayload {
     symbol: string;
+    from: string;
+    to: string;
+    currency: string;
     closes: Record<string, number>;    // YYYYMMDD → adjusted close v USD (total return)
     prices: Record<string, number>;    // YYYYMMDD → cena bez dividend
     dividends: Record<string, number>; // YYYYMMDD → dividenda na akcii
@@ -32,8 +36,13 @@ export async function GET(request: NextRequest) {
     const from = request.nextUrl.searchParams.get('from');
     const to = request.nextUrl.searchParams.get('to');
 
-    if (!from || !to || from.length !== 8 || to.length !== 8) {
+    if (!from || !to || !isValidYmd(from) || !isValidYmd(to) || from > to
+        || to > new Date().toISOString().slice(0, 10).replaceAll('-', '')) {
         return NextResponse.json({ error: 'Parametry from a to (YYYYMMDD) jsou povinné.' }, { status: 400 });
+    }
+
+    if (!['SPY', 'CSPX.L', '^SP500TR', '^GSPC'].includes(symbol)) {
+        return NextResponse.json({ error: 'Nepodporovaný benchmark.' }, { status: 400 });
     }
 
     const key = `${symbol}:${from}:${to}`;
@@ -48,7 +57,7 @@ export async function GET(request: NextRequest) {
     try {
         const res = await fetch(
             `${CHART_URL}/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d&events=div`,
-            { headers: { 'User-Agent': 'Mozilla/5.0' }, cache: 'no-store' },
+            { headers: { 'User-Agent': 'Mozilla/5.0' }, cache: 'no-store', signal: AbortSignal.timeout(20000) },
         );
         if (!res.ok) throw new Error(`Yahoo Finance vrátilo ${res.status}`);
 
@@ -58,16 +67,22 @@ export async function GET(request: NextRequest) {
         const adj: (number | null)[] | undefined = result?.indicators?.adjclose?.[0]?.adjclose;
         const close: (number | null)[] | undefined = result?.indicators?.quote?.[0]?.close;
 
-        if (!timestamps || !adj) throw new Error('Yahoo Finance nevrátilo použitelná data.');
+        if (!timestamps?.length || !adj?.length) throw new Error('Yahoo Finance nevrátilo použitelná data.');
+        if (result.meta?.currency !== 'USD') throw new Error('Benchmark není kotován v USD; přímé porovnání by míchalo měny.');
 
         const closes: Record<string, number> = {};
         const prices: Record<string, number> = {};
         timestamps.forEach((t, i) => {
+            if (!Number.isFinite(t)) return;
             const ymd = toYmd(t);
+            if (ymd > to) return;
+            // A daily bar for an open session is an intraday quote, not a close.
+            const regular = result.meta?.currentTradingPeriod?.regular;
+            if (regular && toYmd(regular.start) === ymd && Date.now() / 1000 < regular.end) return;
             const a = adj[i];
             const c = close?.[i];
-            if (typeof a === 'number' && Number.isFinite(a)) closes[ymd] = a;
-            if (typeof c === 'number' && Number.isFinite(c)) prices[ymd] = c;
+            if (typeof a === 'number' && Number.isFinite(a) && a > 0) closes[ymd] = a;
+            if (typeof c === 'number' && Number.isFinite(c) && c > 0) prices[ymd] = c;
         });
 
         // Jednotlivé dividendy jsou potřeba pro variantu "po zdanění": adjclose
@@ -75,13 +90,17 @@ export async function GET(request: NextRequest) {
         const dividends: Record<string, number> = {};
         const divEvents = result?.events?.dividends ?? {};
         for (const ev of Object.values<any>(divEvents)) {
-            if (typeof ev?.amount === 'number' && typeof ev?.date === 'number') {
+            if (Number.isFinite(ev?.amount) && Number.isFinite(ev?.date) && ev.amount >= 0) {
                 const ymd = toYmd(ev.date);
+                if (ymd > to) continue;
                 dividends[ymd] = (dividends[ymd] ?? 0) + ev.amount;
             }
         }
 
-        const data: BenchmarkPayload = { symbol, closes, prices, dividends };
+        if (!Object.keys(closes).length || !Object.keys(closes).some(date => date >= from)) {
+            throw new Error('Benchmark nemá platné závěrečné ceny ve zvoleném období.');
+        }
+        const data: BenchmarkPayload = { symbol, from, to, currency: 'USD', closes, prices, dividends };
         cache.set(key, { at: Date.now(), data });
         return NextResponse.json(data);
     } catch (error: any) {

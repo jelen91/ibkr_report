@@ -3,27 +3,22 @@
 interface UtilizationBarProps {
     invested: number;
     total: number;
+    complete?: boolean;
 }
 
-export default function UtilizationBar({ invested, total }: UtilizationBarProps) {
-    const rawPercentage = (invested / total) * 100;
+export default function UtilizationBar({ invested, total, complete = true }: UtilizationBarProps) {
+    const rawPercentage = complete && total > 0 ? (invested / total) * 100 : NaN;
     const percentage = Number.isFinite(rawPercentage) ? rawPercentage : 0;
     const barWidth = Math.min(100, Math.max(0, percentage));
 
-    let color = '#2fa061'; // Green
-
-    if (percentage > 90) {
-        color = '#ef4444'; // Red
-    } else if (percentage > 70) {
-        color = '#f59e0b'; // Orange
-    }
+    const color = '#2fa061';
 
     return (
         <div className="card" style={{ padding: '1.5rem' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem', alignItems: 'flex-end' }}>
-                <h3 style={{ margin: 0 }}>Využití Kapitálu</h3>
+                <h3 style={{ margin: 0 }}>Expozice / AUM</h3>
                 <div style={{ textAlign: 'right' }}>
-                    <span style={{ fontSize: '1.5rem', fontWeight: 'bold', color: color }}>{percentage.toFixed(1)}%</span>
+                    <span style={{ fontSize: '1.5rem', fontWeight: 'bold', color: color }}>{complete && total > 0 ? `${percentage.toLocaleString('cs-CZ', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} %` : '—'}</span>
                 </div>
             </div>
 
@@ -43,9 +38,6 @@ export default function UtilizationBar({ invested, total }: UtilizationBarProps)
                     transition: 'width 0.5s ease-in-out, background-color 0.5s'
                 }} />
 
-                {/* Markers for 70% and 90% */}
-                <div style={{ position: 'absolute', left: '70%', top: 0, bottom: 0, width: '2px', backgroundColor: 'rgba(255,255,255,0.3)' }} title="70% Warning" />
-                <div style={{ position: 'absolute', left: '90%', top: 0, bottom: 0, width: '2px', backgroundColor: 'rgba(255,255,255,0.3)' }} title="90% Danger" />
             </div>
         </div>
     );

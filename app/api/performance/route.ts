@@ -26,7 +26,7 @@ export async function GET(request: NextRequest) {
 
         return NextResponse.json(series);
     } catch (error: any) {
-        console.error('Performance API error:', error);
-        return NextResponse.json({ error: String(error?.message ?? error) }, { status: 500 });
+        console.error('Performance API error:', error?.name ?? 'Error');
+        return NextResponse.json({ error: error?.isAxiosError ? 'IBKR spojení selhalo. Zkus načtení opakovat.' : String(error?.message ?? error) }, { status: 500 });
     }
 }

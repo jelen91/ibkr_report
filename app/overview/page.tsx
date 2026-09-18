@@ -1,54 +1,20 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import {
     AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
 } from 'recharts';
+import Link from 'next/link';
 import type { Account } from '../types';
-import type { NavPoint, FlowPoint } from '../lib/twr';
+import { buildOverview, czkRate, type OverviewSeries, type QuotesPayload, type HoldingRow, type ManualRow } from '../lib/overview';
 import { computeFire, milestones, DEFAULT_FIRE, type FireInputs } from '../lib/fire';
-
-// ─── typy ─────────────────────────────────────────────────────────────────────
-
-interface Quote {
-    symbol: string;
-    name: string;
-    currency: string;
-    price: number;
-    history: Record<string, number>;
-}
-
-interface QuotesPayload {
-    quotes: Record<string, Quote>;
-    fx: Record<string, Quote>;
-    btc: Quote | null;
-    failed: string[];
-}
-
-/** Cenný papír držený mimo IBKR — množství zadáváš ty, cenu dotahujeme sami. */
-interface HoldingRow {
-    id: string;
-    symbol: string;
-    quantity: number;
-    note: string;
-}
-
-/** Hotovost nebo cokoli, co se nedá nacenit z burzy. */
-interface ManualRow {
-    id: string;
-    name: string;
-    amount: number;
-    currency: string;
-}
 
 const LS_ACCOUNTS = 'ibkr_accounts';
 const LS_OVERVIEW = 'ibkr_overview';
 
-// Předvyplněno podle toho, co držíš. Symboly jsou německé listingy, které nabízí
-// XTB; kdyby ses trefil do jiné burzy, přepiš je — pod řádkem se vždycky ukáže
-// celý název fondu, takže si ověříš, že sedí.
+// Příklady tickerů; bez uloženého množství se do majetku nic nepřičítá.
 const DEFAULT_HOLDINGS: HoldingRow[] = [
-    { id: 'h1', symbol: 'XDWH.DE', quantity: 12.9633, note: 'MSCI World Health Care' },
+    { id: 'h1', symbol: 'XDWH.DE', quantity: 0, note: 'MSCI World Health Care' },
     { id: 'h2', symbol: 'SXR8.DE', quantity: 0, note: 'iShares Core S&P 500 (XTB)' },
     { id: 'h3', symbol: 'EUNL.DE', quantity: 0, note: 'iShares Core MSCI World (XTB)' },
 ];
@@ -67,34 +33,25 @@ const fmtDate = (ymd: string) =>
 const fmtDateShort = (ymd: string) =>
     ymd.length === 8 ? `${+ymd.slice(6, 8)}.${+ymd.slice(4, 6)}.` : ymd;
 
-const fmtCzk = (v: number) => Math.round(v).toLocaleString('cs-CZ') + ' Kč';
+const fmtCzk = (v: number | null) => v !== null && Number.isFinite(v) ? Math.round(v).toLocaleString('cs-CZ') + ' Kč' : '—';
 
 const fmtNum = (v: number, digits = 4) =>
     v.toLocaleString('cs-CZ', { maximumFractionDigits: digits });
+
+const fmtAsOf = (timestamp?: number) => timestamp && Number.isFinite(timestamp) ? new Date(timestamp).toLocaleString('cs-CZ') : 'datum ceny neuvedeno';
 
 const todayYmd = () => {
     const d = new Date();
     return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
 };
 
-/** Poslední známá hodnota k danému dni — kurzy nejsou o víkendech a svátcích. */
-function valueAt(history: Record<string, number>, date: string, sortedKeys: string[]): number | null {
-    if (history[date] !== undefined) return history[date];
-    let lo = 0, hi = sortedKeys.length - 1, best: number | null = null;
-    while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        if (sortedKeys[mid] <= date) { best = history[sortedKeys[mid]]; lo = mid + 1; }
-        else hi = mid - 1;
-    }
-    return best;
-}
-
 // ─── komponenta ───────────────────────────────────────────────────────────────
 
 export default function OverviewPage() {
     const [accounts, setAccounts] = useState<Account[]>([]);
-    const [ibkrNav, setIbkrNav] = useState<Record<string, NavPoint[]>>({});
-    const [ibkrFlows, setIbkrFlows] = useState<FlowPoint[]>([]);
+    const [ibkrSeries, setIbkrSeries] = useState<Record<string, OverviewSeries>>({});
+    const [refresh, setRefresh] = useState(0);
+    const loadId = useRef(0);
     const [ibkrLoading, setIbkrLoading] = useState(false);
     const [ibkrError, setIbkrError] = useState<string | null>(null);
 
@@ -117,16 +74,17 @@ export default function OverviewPage() {
     useEffect(() => {
         try {
             const raw = localStorage.getItem(LS_ACCOUNTS);
-            const saved: Account[] = raw ? JSON.parse(raw) : [];
+            const parsed = raw ? JSON.parse(raw) : [];
+            const saved: Account[] = Array.isArray(parsed) ? parsed.filter(a => a && typeof a.id === 'string' && typeof a.token === 'string' && typeof a.queryId === 'string') : [];
             setAccounts(saved);
             if (saved.length > 0) loadIbkr(saved);
         } catch { /* bez účtů se ukáže jen zbytek */ }
 
         try {
             const st = JSON.parse(localStorage.getItem(LS_OVERVIEW) || '{}');
-            if (Array.isArray(st.holdings)) setHoldings(st.holdings);
-            if (Array.isArray(st.manual)) setManual(st.manual);
-            if (typeof st.btcAmount === 'number') setBtcAmount(st.btcAmount);
+            if (Array.isArray(st.holdings)) setHoldings(st.holdings.filter((h: HoldingRow) => h && typeof h.symbol === 'string' && Number.isFinite(h.quantity)));
+            if (Array.isArray(st.manual)) setManual(st.manual.filter((m: ManualRow) => m && typeof m.currency === 'string' && Number.isFinite(m.amount)));
+            if (Number.isFinite(st.btcAmount)) setBtcAmount(st.btcAmount);
             if (st.fire && typeof st.fire === 'object') setFire({ ...DEFAULT_FIRE, ...st.fire });
         } catch { /* výchozí hodnoty */ }
 
@@ -137,215 +95,67 @@ export default function OverviewPage() {
     // ── uložení ──
     useEffect(() => {
         if (!hydrated) return;
-        localStorage.setItem(LS_OVERVIEW, JSON.stringify({ holdings, manual, btcAmount, fire }));
+        try { localStorage.setItem(LS_OVERVIEW, JSON.stringify({ holdings, manual, btcAmount, fire })); } catch { /* browser storage may be unavailable */ }
     }, [hydrated, holdings, manual, btcAmount, fire]);
+
+    const requestedCurrencies = [...new Set([...Object.values(ibkrSeries).map(s => s.currency), ...manual.map(m => m.currency)])].sort().join(',');
 
     // ── kurzy ──
     // Debounce, aby se při psaní tickeru neposílal dotaz na každý znak.
     useEffect(() => {
+        if (!hydrated) return;
+        const controller = new AbortController();
         const symbols = holdings.filter(h => h.symbol.trim()).map(h => h.symbol.trim());
         const timer = setTimeout(() => {
-            const url = `/api/quotes?symbols=${encodeURIComponent(symbols.join(','))}&btc=1&range=1y`;
+            const url = `/api/quotes?symbols=${encodeURIComponent(symbols.join(','))}&btc=1&range=1y&currencies=${encodeURIComponent(requestedCurrencies)}`;
             setQuotesError(null);
-            fetch(url)
+            fetch(url, { signal: controller.signal })
                 .then(async res => {
                     const json = await res.json();
                     if (!res.ok) throw new Error(json.error || 'Kurzy se nepodařilo načíst');
-                    setQuotes(json);
+                    if (!controller.signal.aborted) setQuotes(json);
                 })
-                .catch(e => setQuotesError(e.message));
+                .catch(e => { if (!controller.signal.aborted) { setQuotes(null); setQuotesError(e.message); } });
         }, 500);
-        return () => clearTimeout(timer);
-    }, [holdings.map(h => h.symbol).join(',')]); // eslint-disable-line react-hooks/exhaustive-deps
+        return () => { clearTimeout(timer); controller.abort(); };
+    }, [hydrated, refresh, requestedCurrencies, holdings.map(h => h.symbol).join(',')]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Účty se načítají nezávisle na sobě: `Promise.all` by při jediném selhání
     // zahodil i data účtů, které se stáhly v pořádku, a v přehledu by pak IBKR
     // chybělo celé.
-    async function loadIbkr(list: Account[]) {
+    async function loadIbkr(list: Account[], force = false) {
+        const requestId = ++loadId.current;
         setIbkrLoading(true);
         setIbkrError(null);
 
         const results = await Promise.allSettled(list.map(async acct => {
-            const res = await fetch('/api/performance', {
+            const res = await fetch(`/api/performance${force ? '?force=1' : ''}`, {
                 headers: { 'x-flex-token': acct.token, 'x-flex-query-id': acct.queryId },
             });
             const json = await res.json();
             if (!res.ok) throw new Error(json.error || 'Chyba načítání');
-            return [acct.id, json.nav as NavPoint[], (json.flows ?? []) as FlowPoint[]] as const;
+            if (!Array.isArray(json.nav) || !json.nav.length || !json.currency || !json.accountIds?.length) throw new Error('Neúplná historie účtu nebo měna');
+            return [acct.id, json as OverviewSeries] as const;
         }));
 
-        const loaded: Record<string, NavPoint[]> = {};
-        const flows: FlowPoint[] = [];
+        if (requestId !== loadId.current) return;
+        const loaded: Record<string, OverviewSeries> = {};
         const failures: string[] = [];
         results.forEach((r, i) => {
-            if (r.status === 'fulfilled') { loaded[r.value[0]] = r.value[1]; flows.push(...r.value[2]); }
+            if (r.status === 'fulfilled') { loaded[r.value[0]] = r.value[1]; }
             else failures.push(`${list[i].name}: ${r.reason?.message ?? r.reason}`);
         });
 
-        setIbkrNav(loaded);
-        setIbkrFlows(flows);
+        setIbkrSeries(loaded);
         setIbkrError(failures.length ? failures.join(' · ') : null);
         setIbkrLoading(false);
     }
 
     // ── výpočet ──
     const view = useMemo(() => {
-        const fxCzk = (currency: string, date: string): number => {
-            if (currency === 'CZK') return 1;
-            const q = quotes?.fx[currency];
-            if (!q) return 0;
-            const keys = Object.keys(q.history).sort();
-            return valueAt(q.history, date, keys) ?? q.price;
-        };
-
         const today = todayYmd();
-
-        // ── jednotlivé složky k dnešku ──
-        const parts: { key: string; label: string; value: number; detail: string }[] = [];
-
-        // Rozpad po účtech, ať je vidět, který se načetl a který ne — souhrnný
-        // řádek s nulou by jinak vypadal, jako by se IBKR do přehledu nedostalo.
-        const ibkrRows = accounts.map(acct => {
-            const series = ibkrNav[acct.id];
-            const last = series?.length ? series[series.length - 1] : null;
-            return {
-                account: acct,
-                value: last?.nav ?? 0,
-                date: last?.date ?? null,
-                loaded: !!last,
-            };
-        });
-        const ibkrTotal = ibkrRows.reduce((s, r) => s + r.value, 0);
-
-        if (accounts.length > 0) {
-            parts.push({
-                key: 'ibkr',
-                label: accounts.length > 1 ? `IBKR (${accounts.length} účty)` : 'IBKR',
-                value: ibkrTotal,
-                detail: accounts.map(a => a.name).join(', '),
-            });
-        }
-
-        const btcQuote = quotes?.btc ?? null;
-        const btcValue = btcQuote ? btcAmount * btcQuote.price : 0;
-        if (btcAmount > 0) {
-            parts.push({
-                key: 'btc',
-                label: 'Bitcoin',
-                value: btcValue,
-                detail: `${fmtNum(btcAmount, 8)} BTC × ${fmtCzk(btcQuote?.price ?? 0)}`,
-            });
-        }
-
-        const holdingValues = holdings.map(h => {
-            const q = quotes?.quotes[h.symbol.trim()];
-            const rate = q ? fxCzk(q.currency, today) : 0;
-            const value = q ? h.quantity * q.price * rate : 0;
-            return { row: h, quote: q ?? null, value };
-        });
-
-        for (const hv of holdingValues) {
-            if (hv.value <= 0) continue;
-            parts.push({
-                key: `h:${hv.row.id}`,
-                label: hv.row.note || hv.row.symbol,
-                value: hv.value,
-                detail: `${fmtNum(hv.row.quantity)} ks × ${fmtNum(hv.quote?.price ?? 0, 2)} ${hv.quote?.currency ?? ''}`,
-            });
-        }
-
-        for (const m of manual) {
-            if (!m.amount) continue;
-            const rate = fxCzk(m.currency, today);
-            parts.push({
-                key: `m:${m.id}`,
-                label: m.name || 'Ruční položka',
-                value: m.amount * rate,
-                detail: m.currency === 'CZK' ? 'ruční zadání' : `${fmtNum(m.amount, 2)} ${m.currency}`,
-            });
-        }
-
-        const total = parts.reduce((s, p) => s + p.value, 0);
-
-        // ── historie ────────────────────────────────────────────────────────
-        // Tržní složky mají skutečnou cenovou historii; ruční položky ji nemají,
-        // takže se drží na dnešní hodnotě. Množství se bere dnešní — graf tedy
-        // ukazuje, jak by se dnešní majetek vyvíjel, ne co jsi kdy dokupoval.
-        const dateSet = new Set<string>();
-        for (const acct of accounts) for (const p of ibkrNav[acct.id] ?? []) dateSet.add(p.date);
-        if (btcAmount > 0 && btcQuote) for (const d of Object.keys(btcQuote.history)) dateSet.add(d);
-        for (const hv of holdingValues) {
-            if (hv.value > 0 && hv.quote) for (const d of Object.keys(hv.quote.history)) dateSet.add(d);
-        }
-
-        const dates = [...dateSet].sort();
-        const manualTotal = manual.reduce((s, m) => s + m.amount * fxCzk(m.currency, today), 0);
-
-        const ibkrKeys: Record<string, string[]> = {};
-        const ibkrHist: Record<string, Record<string, number>> = {};
-        for (const acct of accounts) {
-            const series = ibkrNav[acct.id] ?? [];
-            const h: Record<string, number> = {};
-            for (const p of series) h[p.date] = p.nav;
-            ibkrHist[acct.id] = h;
-            ibkrKeys[acct.id] = series.map(p => p.date);
-        }
-
-        const btcKeys = btcQuote ? Object.keys(btcQuote.history).sort() : [];
-        const holdingKeys = holdingValues.map(hv => hv.quote ? Object.keys(hv.quote.history).sort() : []);
-        const fxKeysByCurrency: Record<string, string[]> = {};
-        for (const [code, q] of Object.entries(quotes?.fx ?? {})) {
-            fxKeysByCurrency[code] = Object.keys(q.history).sort();
-        }
-        const fxAt = (currency: string, date: string) => {
-            if (currency === 'CZK') return 1;
-            const q = quotes?.fx[currency];
-            if (!q) return 0;
-            return valueAt(q.history, date, fxKeysByCurrency[currency] ?? []) ?? q.price;
-        };
-
-        const chart = dates.map(date => {
-            let ibkr = 0;
-            for (const acct of accounts) {
-                const v = valueAt(ibkrHist[acct.id], date, ibkrKeys[acct.id]);
-                if (v !== null) ibkr += v;
-            }
-
-            const btc = btcQuote && btcAmount > 0
-                ? btcAmount * (valueAt(btcQuote.history, date, btcKeys) ?? 0)
-                : 0;
-
-            let etf = 0;
-            holdingValues.forEach((hv, i) => {
-                if (!hv.quote || hv.value <= 0) return;
-                const price = valueAt(hv.quote.history, date, holdingKeys[i]);
-                if (price === null) return;
-                etf += hv.row.quantity * price * fxAt(hv.quote.currency, date);
-            });
-
-            return {
-                date,
-                IBKR: Math.round(ibkr),
-                Bitcoin: Math.round(btc),
-                ETF: Math.round(etf),
-                Ostatní: Math.round(manualTotal),
-                total: Math.round(ibkr + btc + etf + manualTotal),
-            };
-        }).filter(r => r.total > 0);
-
-        // Stejný problém jako u výkonnosti: dokud byl účet skoro prázdný, dělaly
-        // by drobné částky nesmyslná procenta (+55 000 % apod.). Graf proto
-        // začíná až tam, kde majetek dosáhl 2 % svého maxima.
-        const peak = Math.max(0, ...chart.map(r => r.total));
-        const firstMeaningful = chart.findIndex(r => r.total >= peak * 0.02);
-        const trimmed = firstMeaningful > 0 ? chart.slice(firstMeaningful) : chart;
-
-        // růst za období, které graf pokrývá
-        const first = trimmed[0];
-        const last = trimmed[trimmed.length - 1];
-        const growth = first && last && first.total > 0
-            ? { abs: last.total - first.total, pct: (last.total / first.total - 1) * 100, from: first.date }
-            : null;
+        const valuation = buildOverview({ accounts, series: ibkrSeries, holdings, manual, btcAmount, quotes, today });
+        const { total } = valuation;
 
         // ── FIRE ──────────────────────────────────────────────────────────
         // Návrh měsíčního vkladu se bere ze skutečných převodů na IBKR za
@@ -356,22 +166,32 @@ export default function OverviewPage() {
             d.setMonth(d.getMonth() - 6);
             return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
         })();
-        const recentDeposits = ibkrFlows
-            .filter(f => f.date >= sixMonthsAgo)
-            .reduce((sum, f) => sum + f.amount, 0);
-        const suggestedMonthly = Math.max(0, Math.round(recentDeposits / 6));
-
-        const fireInputs: FireInputs = { ...fire, current: total };
+        let recentDeposits = 0;
+        let depositsComplete = accounts.length > 0 && total !== null;
+        const recentCutoff = new Date();
+        recentCutoff.setDate(recentCutoff.getDate() - 4);
+        const cutoffYmd = recentCutoff.toISOString().slice(0, 10).replaceAll('-', '');
+        for (const account of accounts) {
+            const data = ibkrSeries[account.id];
+            if (!data || !data.nav.length || data.nav[0].date > sixMonthsAgo || data.nav.at(-1)!.date < cutoffYmd) { depositsComplete = false; continue; }
+            for (const flow of data.flows.filter(f => f.date >= sixMonthsAgo && f.date <= today)) {
+                const rate = czkRate(quotes, data.currency, flow.date);
+                if (rate === null) depositsComplete = false;
+                else recentDeposits += flow.amount * rate;
+            }
+        }
+        const suggestedMonthly = depositsComplete ? Math.max(0, Math.round(recentDeposits / 6)) : 0;
+        const fireInputs: FireInputs = { ...fire, current: total ?? 0 };
         const fireResult = computeFire(fireInputs);
         const fireMilestones = milestones(fireInputs, [5_000_000, 10_000_000, 15_000_000, fire.target])
             .filter((ms, i, arr) => arr.findIndex(o => o.level === ms.level) === i && ms.level <= fire.target)
             .sort((a, b) => a.level - b.level);
 
         return {
-            parts, total, chart: trimmed, growth, holdingValues, btcQuote, btcValue, ibkrRows, ibkrTotal,
+            ...valuation,
             fireInputs, fireResult, fireMilestones, suggestedMonthly,
         };
-    }, [accounts, ibkrNav, ibkrFlows, holdings, manual, btcAmount, quotes, fire]);
+    }, [accounts, ibkrSeries, holdings, manual, btcAmount, quotes, fire]);
 
     // ── editace ──
     const updateHolding = (id: string, patch: Partial<HoldingRow>) =>
@@ -385,7 +205,7 @@ export default function OverviewPage() {
                 <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', width: '100%', flexWrap: 'wrap', gap: '0.5rem' }}>
                     <h1 style={{ margin: 0 }}>Celkový majetek</h1>
                     <button
-                        onClick={() => accounts.length > 0 && loadIbkr(accounts)}
+                        onClick={() => { setRefresh(n => n + 1); if (accounts.length > 0) loadIbkr(accounts, true); }}
                         style={tabStyle(false)}
                         disabled={ibkrLoading}
                     >
@@ -401,6 +221,8 @@ export default function OverviewPage() {
                     <div style={{ fontSize: '2.4rem', fontWeight: 700, color: COLORS[0], lineHeight: 1.2 }}>
                         {fmtCzk(view.total)}
                     </div>
+                    {view.missing.length > 0 && <p style={{ color: 'var(--danger-color)', fontSize: '0.85rem' }}>Celkovou hodnotu nelze určit. Chybí ocenění nebo se překrývají účty: {view.missing.join(', ')}. Oceněná část: {fmtCzk(view.knownTotal)}.</p>}
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.75rem' }}>Součet posledních dostupných ocenění; IBKR používá datum reportu uvedené níže. Nejde o živý zůstatek.</p>
                     {view.growth && (
                         <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginTop: '0.35rem' }}>
                             Od {fmtDate(view.growth.from)}{' '}
@@ -408,7 +230,7 @@ export default function OverviewPage() {
                                 {view.growth.abs >= 0 ? '+' : ''}{fmtCzk(view.growth.abs)}
                             </strong>
                             {' '}— je v tom ale i to, co jsi mezitím vložil, takže to není výnos.
-                            {' '}Ten najdeš na záložce <a href="/performance" style={{ color: COLORS[0] }}>Výkonnost</a>.
+                            {' '}Ten najdeš na záložce <Link href="/performance" style={{ color: COLORS[0] }}>Výkonnost</Link>.
                         </div>
                     )}
 
@@ -424,7 +246,7 @@ export default function OverviewPage() {
                                         <span style={{ color: 'var(--text-secondary)', fontSize: '0.75rem', marginLeft: '0.5rem' }}>{p.detail}</span>
                                     </td>
                                     <td style={{ padding: '0.5rem 0', textAlign: 'right', color: 'var(--text-secondary)', fontSize: '0.75rem' }}>
-                                        {view.total > 0 ? ((p.value / view.total) * 100).toFixed(1) + ' %' : ''}
+                                        {view.total !== null && view.total > 0 && p.value !== null ? ((p.value / view.total) * 100).toFixed(1) + ' %' : ''}
                                     </td>
                                     <td style={{ padding: '0.5rem 0 0.5rem 1rem', textAlign: 'right', fontWeight: 600 }}>
                                         {fmtCzk(p.value)}
@@ -450,17 +272,17 @@ export default function OverviewPage() {
                     )}
                     {quotes?.failed?.length ? (
                         <p style={{ color: 'var(--danger-color)', fontSize: '0.8rem', marginBottom: 0 }}>
-                            Nepodařilo se nacenit: {quotes.failed.join(', ')} — zkontroluj ticker.
+                            Nedostupná tržní data: {quotes.failed.join(', ')}. FX označuje měnový kurz; u cenných papírů ověř ticker.
                         </p>
                     ) : null}
                 </div>
 
                 {/* ── FIRE ── */}
-                <FireSection
+                {view.total !== null && <FireSection
                     view={view}
                     fire={fire}
                     setFire={setFire}
-                />
+                />}
 
                 {/* ── graf ── */}
                 {view.chart.length > 1 && (
@@ -511,7 +333,7 @@ export default function OverviewPage() {
                         <p style={{ margin: 0, fontSize: '0.85rem' }}>
                             Nemáš tu uložený žádný IBKR účet, proto se do součtu nic nezapočítalo.
                             Přidej ho na záložce{' '}
-                            <a href="/" style={{ color: COLORS[0] }}>Portfolio IBKR</a> — účty se ukládají
+                            <Link href="/" style={{ color: COLORS[0] }}>Portfolio IBKR</Link> — účty se ukládají
                             do prohlížeče a tahle stránka je pak najde sama.
                         </p>
                     ) : (
@@ -551,12 +373,12 @@ export default function OverviewPage() {
                             style={{ ...inputStyle, width: '150px' }}
                         />
                         <span style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
-                            BTC × {fmtCzk(view.btcQuote?.price ?? 0)} ={' '}
+                            BTC × {fmtCzk(view.btcQuote?.price ?? null)} ={' '}
                             <strong style={{ color: 'var(--text-primary)' }}>{fmtCzk(view.btcValue)}</strong>
                         </span>
                     </div>
                     <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: 0 }}>
-                        Kurz z CoinGecko, rovnou v korunách.
+                        Kurz z CoinGecko, rovnou v korunách. Čas ceny: {fmtAsOf(view.btcQuote?.asOf)}.
                     </p>
                 </div>
 
@@ -586,6 +408,7 @@ export default function OverviewPage() {
                                         {hv.quote && (
                                             <div style={{ fontSize: '0.68rem', color: 'var(--text-secondary)', marginTop: 2, maxWidth: 180 }}>
                                                 {hv.quote.name}
+                                                <div>Čas ceny: {fmtAsOf(hv.quote.asOf)}</div>
                                             </div>
                                         )}
                                     </td>
@@ -608,7 +431,7 @@ export default function OverviewPage() {
                                         {hv.quote ? `${fmtNum(hv.quote.price, 2)} ${hv.quote.currency}` : '—'}
                                     </td>
                                     <td style={{ ...tdStyle, textAlign: 'right', fontWeight: 600 }}>
-                                        {hv.value > 0 ? fmtCzk(hv.value) : '—'}
+                                        {fmtCzk(hv.value)}
                                     </td>
                                     <td style={{ ...tdStyle, textAlign: 'right' }}>
                                         <button
@@ -672,7 +495,7 @@ export default function OverviewPage() {
                                             </select>
                                         </td>
                                         <td style={{ ...tdStyle, textAlign: 'right', fontWeight: 600 }}>
-                                            {part ? fmtCzk(part.value) : '—'}
+                                            {m.amount === 0 ? fmtCzk(0) : part ? fmtCzk(part.value) : '—'}
                                         </td>
                                         <td style={{ ...tdStyle, textAlign: 'right' }}>
                                             <button
@@ -720,8 +543,9 @@ const yearWord = (y: number) => (y === 1 ? 'rok' : y >= 2 && y <= 4 ? 'roky' : '
 const fmtYears = (months: number | null) => {
     if (months === null) return 'nikdy při tomhle tempu';
     if (months <= 0) return 'hotovo';
-    const y = Math.floor(months / 12);
-    const m = Math.round(months % 12);
+    const rounded = Math.ceil(months);
+    const y = Math.floor(rounded / 12);
+    const m = rounded % 12;
     if (y === 0) return `${m} měs.`;
     return m === 0 ? `${y} ${yearWord(y)}` : `${y} ${yearWord(y)} ${m} měs.`;
 };
@@ -759,7 +583,7 @@ function FireSection({ view, fire, setFire }: {
             {/* hlavní čísla */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '0.75rem', margin: '1.25rem 0' }}>
                 <Stat
-                    label="Portfolio si vydělá samo"
+                    label="Modelový výnos za rok"
                     value={fmtCzk(r.passiveAnnual)}
                     sub={`${fmtCzk(r.passiveMonthly)} měsíčně při ${dec(fire.annualReturn * 100, 0)} %`}
                     color={COLORS[2]}
@@ -779,7 +603,7 @@ function FireSection({ view, fire, setFire }: {
                 <Stat
                     label="Až tam budeš, vybereš si"
                     value={fmtCzk(r.withdrawAtTarget)}
-                    sub="měsíčně, napořád"
+                    sub="měsíčně podle zvolené míry výběru"
                     color={COLORS[3]}
                 />
             </div>
@@ -788,14 +612,14 @@ function FireSection({ view, fire, setFire }: {
             <div style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', alignItems: 'center', padding: '0.75rem 0', borderTop: '1px solid #334155', borderBottom: '1px solid #334155' }}>
                 <label style={fireLabel}>
                     Cíl
-                    <input type="number" value={fire.target || ''} step="1000000"
-                        onChange={e => set({ target: Number(e.target.value) || 0 })}
+                    <input type="number" min="1" value={fire.target || ''} step="1000000"
+                        onChange={e => set({ target: Math.max(1, Number(e.target.value) || 1) })}
                         style={{ ...inputStyle, width: '130px' }} /> Kč
                 </label>
                 <label style={fireLabel}>
                     Měsíčně přidávám
-                    <input type="number" value={fire.monthly || ''}
-                        onChange={e => set({ monthly: Number(e.target.value) || 0 })}
+                    <input type="number" min="0" value={fire.monthly || ''}
+                        onChange={e => set({ monthly: Math.max(0, Number(e.target.value) || 0) })}
                         style={{ ...inputStyle, width: '120px' }} /> Kč
                 </label>
                 {view.suggestedMonthly > 0 && view.suggestedMonthly !== fire.monthly && (
@@ -806,19 +630,19 @@ function FireSection({ view, fire, setFire }: {
                 <label style={fireLabel}>
                     Zhodnocení
                     <input type="number" value={(fire.annualReturn * 100).toFixed(1)} step="0.5"
-                        onChange={e => set({ annualReturn: (Number(e.target.value) || 0) / 100 })}
+                        onChange={e => set({ annualReturn: Math.max(-99.9, Number(e.target.value) || 0) / 100 })}
                         style={{ ...inputStyle, width: '70px' }} /> % ročně
                 </label>
                 <label style={fireLabel}>
                     Výběr
                     <input type="number" value={(fire.withdrawalRate * 100).toFixed(2)} step="0.25"
-                        onChange={e => set({ withdrawalRate: (Number(e.target.value) || 0) / 100 })}
+                        onChange={e => set({ withdrawalRate: Math.max(0, Number(e.target.value) || 0) / 100 })}
                         style={{ ...inputStyle, width: '70px' }} /> % ročně
                 </label>
                 <label style={fireLabel}>
                     Inflace
                     <input type="number" value={(fire.inflation * 100).toFixed(1)} step="0.5"
-                        onChange={e => set({ inflation: (Number(e.target.value) || 0) / 100 })}
+                        onChange={e => set({ inflation: Math.max(-99.9, Number(e.target.value) || 0) / 100 })}
                         style={{ ...inputStyle, width: '70px' }} /> %
                 </label>
             </div>
@@ -854,7 +678,7 @@ function FireSection({ view, fire, setFire }: {
                 <Insight title="Má smysl přidávat dál?">
                     Každých <strong>10 000 Kč měsíčně navíc</strong> ti cíl přiblíží
                     o <strong style={{ color: COLORS[2] }}>{r.monthsSavedPer10k !== null ? dec(r.monthsSavedPer10k) : '—'} měsíce</strong>.
-                    {r.crossoverPortfolio !== null && (
+                    {r.crossoverPortfolio !== null && r.growthFromMarket + r.growthFromDeposits > 0 && (
                         <> Zatím dělá trh {dec((r.growthFromMarket / (r.growthFromMarket + r.growthFromDeposits)) * 100, 0)} %
                             měsíčního přírůstku a zbytek přidáváš ty. Poprvé tě přeroste
                             při <strong>{fmtCzk(r.crossoverPortfolio)}</strong>, tedy zhruba
@@ -864,10 +688,9 @@ function FireSection({ view, fire, setFire }: {
                 </Insight>
 
                 <Insight title="Kdybys od teď nepřidal ani korunu">
-                    Cíle dosáhneš i tak, jen ti to potrvá <strong>{fmtYears(r.coastMonths)}</strong>
-                    {' '}({fmtMonthYear(r.coastDate)}) — o {fmtYears(
-                        r.coastMonths !== null && r.monthsToGoal !== null ? r.coastMonths - r.monthsToGoal : null,
-                    )} déle než při současném tempu.
+                    {r.coastMonths === null ? 'Při zadaném výnosu se bez dalších vkladů k cíli nedostaneš.' : <>
+                        Model dosáhne cíle za <strong>{fmtYears(r.coastMonths)}</strong> ({fmtMonthYear(r.coastDate)}).
+                    </>}
                 </Insight>
 
                 <Insight title="Pozor na kupní sílu">
@@ -883,9 +706,8 @@ function FireSection({ view, fire, setFire }: {
             <p style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: 0, marginTop: '1rem', lineHeight: 1.7 }}>
                 Není to předpověď, ale jedna varianta „když to půjde takhle dál“. Průměrné zhodnocení se
                 v jednotlivých letech nedodrží a nejvíc rozhodne, jak vyjdou hned ty první — stejný průměr
-                se špatným začátkem znamená výrazně horší výsledek. Pravidlo 4 % navíc vzniklo pro
-                třicetiletý horizont; na dřívější odchod do důchodu se běžně doporučuje spíš 3,25 až 3,5 %,
-                zkus si to v poli výše přepnout a uvidíš rozdíl.
+                se špatným začátkem znamená výrazně horší výsledek. Výše výběru je pouze modelový přepočet zvolené sazby, nikoli záruka udržitelného příjmu.
+                Model nezahrnuje daně, poplatky ani kolísání výnosů.
             </p>
         </div>
     );
