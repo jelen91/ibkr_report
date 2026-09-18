@@ -4,7 +4,7 @@ Lokální přehled IBKR Flex reportů, srovnání výkonnosti s benchmarkem a mo
 
 ## Spuštění a kontrola
 
-Vyžaduje pnpm 9 nebo 10. Projektové `.npmrc` automaticky volí Node.js 24.19.0 (první spuštění jej může stáhnout); systémový Node se nemění. Při ručním spouštění bez pnpm použijte Node.js 20.9 nebo novější.
+Vyžaduje Node.js 24 a pnpm 9.12.3. Před spuštěním aktivujte Node.js 24 ve svém správci verzí (s nvm stačí `nvm install` a `nvm use`; projekt obsahuje `.nvmrc`). Vercel vybírá podporovanou řadu Node.js podle `engines.node` v `package.json`. Nastavení `use-node-version` do projektového `.npmrc` nepatří, protože ho Vercel odmítá.
 
 ```sh
 pnpm install --frozen-lockfile
