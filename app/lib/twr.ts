@@ -87,6 +87,9 @@ export function computeTwr(
 
 /** Last observed value only; no look-ahead into a future price or FX quote. */
 export function valueOnOrBefore(values: Record<string, number>, date: string): number | undefined {
+    // An observation on the day itself is the latest one; skip the scan.
+    const exact = values[date];
+    if (Number.isFinite(exact) && exact > 0) return exact;
     let found: string | undefined;
     for (const day of Object.keys(values)) {
         if (day <= date && (!found || day > found) && Number.isFinite(values[day]) && values[day] > 0) found = day;

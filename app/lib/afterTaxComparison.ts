@@ -167,7 +167,7 @@ export function computeAfterTaxComparison(opts: AfterTaxComparisonOptions): Afte
     if (foreignIncomeMode === 'separate15') warnings.add('Scénář řadí dividendy do samostatného základu zahraničních příjmů se sazbou 15 % bez slevy na poplatníka. Úroky zůstávají v progresivním základu, protože jejich způsobilost není doložena.');
     if (foreignIncomeMode === 'auto') warnings.add('Pro každý rok a každou strategii se automaticky volí nižší česká daň ze dvou přípustných způsobů zdanění zahraničních dividend: společný základ se sazbami 15 / 23 % a slevou na poplatníka, nebo samostatný základ se sazbou 15 % bez této slevy. Při shodě se použije samostatný základ. Úroky zůstávají ve společném základu a nárok na zahraniční zápočet se touto volbou nezvyšuje.');
     if (opts.distributing) warnings.add('SPY modeluje 15% americkou srážku a reinvestici čisté dividendy v den dividendové události. Skutečný den výplaty/reinvestice a poplatky se mohou lišit.');
-    warnings.add('Bez ověřeného data nabytí se neuplatňuje časové osvobození. Brokerovo P/L a realizace opcí jsou odhad daňových vstupů; výpis nemusí pokrývat celý rok ani jiné investice.');
+    warnings.add('Bez ověřeného data nabytí se neuplatňuje časové osvobození. Kurzy IBKR a okamžik realizace opcí jsou odhad daňových vstupů; výpis nemusí pokrývat celý rok ani jiné investice.');
 
     const fromYear = Number(opts.from.slice(0, 4));
     const toYear = Number(opts.to.slice(0, 4));

@@ -12,6 +12,7 @@ import crypto from 'crypto';
 import { isValidYmd, mergeNavSeries, type NavPoint, type FlowPoint } from './twr';
 import { TRADES_WITHOUT_EXECUTION_WARNING, type TaxInputs, type RealizedTrade } from './tax';
 import { mergeCashBalances, sumByDate, type CashBalance } from './cash';
+import { mergeMonthEndFx } from './taxFx';
 
 const SEND_URL = 'https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest';
 const PICKUP_URL = 'https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement';
@@ -29,7 +30,7 @@ const EXTERNAL_FLOW_CODES = new Set(['DEP', 'WITH']);
 // vstoupily do základu dvakrát.
 const TAX_TRADE_LEVEL = 'EXECUTION';
 
-const CACHE_SCHEMA_VERSION = 5;
+const CACHE_SCHEMA_VERSION = 6;
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const CACHE_DIR = path.join(process.cwd(), 'data');
 
@@ -52,6 +53,8 @@ export interface PerformanceSeries {
     cashByCurrency?: CashBalance[];
     /** NAV bez hotovosti a naběhlých úroků/dividend po dnech; chybí, když NAV nemá sloupec cash. */
     nonCashByDate?: Record<string, number>;
+    /** Kurzy měn s loty do bázové měny k poslednímu dni každého měsíce: měna → YYYYMM → kurz. */
+    monthEndFx?: Record<string, Record<string, number>>;
     fetchedAt: number;
     schemaVersion: number;
     warnings: string[];
@@ -217,6 +220,8 @@ export function extractSeries(statements: any[]): PerformanceSeries {
         let fxPositions: any[] | undefined;
         const nonCashByDate: Record<string, number> = {};
         let nonCashComplete = true;
+        const lots: any[] = [];
+        const conversions: { from: string; to: string; date: string; rate: number }[] = [];
 
         // Repeated query periods must not duplicate an account's transactions.
         // Keep identical, ID-less rows within one statement: two equal deposits
@@ -313,9 +318,13 @@ export function extractSeries(statements: any[]): PerformanceSeries {
             if (stmt.OpenPositions === undefined) warnings.add('Chybí sekce Open Positions; nelze modelovat daň při likvidaci.');
             // Order summaries and closed lots describe the same executions.
             // Multiple closed lots can share a trade ID, so do not even run
-            // execution deduplication on these unused levels.
-            trades.push(...uniqueRows(stmt, 'Trades', 'Trade',
-                row => String(row.levelOfDetail).toUpperCase() === TAX_TRADE_LEVEL));
+            // execution deduplication on these levels. A closed lot follows the
+            // execution that closed it; repeated statements drop both together.
+            const accepted = uniqueRows(stmt, 'Trades', 'Trade',
+                row => String(row.levelOfDetail).toUpperCase() === TAX_TRADE_LEVEL);
+            trades.push(...accepted);
+            const acceptedKeys = new Set(accepted.map(lotKey));
+            lots.push(...closedLotRows(stmt).filter(row => acceptedKeys.has(lotKey(row))));
             const snapshotDate = stmt.toDate ? flexDate(stmt.toDate, 'pozicích') : '';
             if (snapshotDate >= latestPositionDate) {
                 latestPositionDate = snapshotDate;
@@ -323,6 +332,11 @@ export function extractSeries(statements: any[]): PerformanceSeries {
                 fxPositions = stmt.FxPositions === undefined ? undefined : asArray<any>(stmt.FxPositions?.FxPosition);
             }
             for (const row of asArray<any>(stmt.ConversionRates?.ConversionRate)) {
+                const anyRate = Number(row.rate);
+                const anyDate = String(row.reportDate ?? '').replaceAll('-', '');
+                if (anyRate > 0 && isValidYmd(anyDate)) {
+                    conversions.push({ from: String(row.fromCurrency ?? ''), to: String(row.toCurrency ?? ''), date: anyDate, rate: anyRate });
+                }
                 if (String(row.fromCurrency) !== 'USD') continue;
                 // Currency is validated after all NAV rows have been inspected.
                 const target = String(row.toCurrency ?? '');
@@ -341,13 +355,27 @@ export function extractSeries(statements: any[]): PerformanceSeries {
         if (currency === 'USD') for (const row of nav) fxToUsd[row.date] = 1;
         fillFxGaps(fxToUsd, nav.map(n => n.date));
         if (nav.some(n => !fxToUsd[n.date])) warnings.add('Chybí některé kurzy USD. Přepočet do USD a srovnání s americkým benchmarkem nejsou pro celé období dostupné.');
-        tax.trades = extractRealizedTrades({ AccountInformation: { currency }, Trades: { Trade: trades } });
-        tax.unrealized = extractUnrealizedPositions(positions, currency, latestPositionDate);
+        const ratesToBase = new Map<string, Record<string, number>>();
+        for (const row of conversions) {
+            if (row.to !== currency) continue;
+            const table = ratesToBase.get(row.from) ?? {};
+            table[row.date] = row.rate;
+            ratesToBase.set(row.from, table);
+        }
+        const rateOn = (from: string, date: string) => rateOnOrBefore(ratesToBase.get(from), date);
+        tax.trades = extractRealizedTrades({ AccountInformation: { currency }, Trades: { Trade: trades, Lot: lots } }, rateOn);
+        tax.unrealized = extractUnrealizedPositions(positions, currency, latestPositionDate, rateOn);
+        const lotCurrencies = new Set([...tax.trades, ...tax.unrealized].flatMap(t => t.lot && t.lot.currency !== currency ? [t.lot.currency] : []));
+        const monthEndFx = Object.fromEntries([...lotCurrencies].flatMap(from => {
+            const table = ratesToBase.get(from);
+            return table ? [[from, monthEndRates(table)]] : [];
+        }));
         extracted.push({
             accountIds: [accountId], currency, fromDate: nav[0].date, toDate: nav[nav.length - 1].date,
             nav, flows: [...flowByDate].map(([date, amount]) => ({ date, amount })).sort((a, b) => a.date.localeCompare(b.date)),
             fxToUsd, tax, ...(fxPositions ? { cashByCurrency: extractCashBalances(fxPositions, currency) } : {}),
             ...(nonCashComplete ? { nonCashByDate } : {}),
+            ...(lotCurrencies.size ? { monthEndFx } : {}),
             fetchedAt: Date.now(), schemaVersion: CACHE_SCHEMA_VERSION, warnings: [],
         });
     }
@@ -355,7 +383,8 @@ export function extractSeries(statements: any[]): PerformanceSeries {
     const merged = !combined ? extracted[0] : {
         ...extracted[0], ...combined,
         cashByCurrency: mergeCashBalances(extracted.map(s => s.cashByCurrency)),
-        nonCashByDate: sumByDate(extracted.map(s => s.nonCashByDate), combined.nav.map(n => n.date)), tax: {
+        nonCashByDate: sumByDate(extracted.map(s => s.nonCashByDate), combined.nav.map(n => n.date)),
+        monthEndFx: mergeMonthEndFx(extracted.map(s => s.monthEndFx)), tax: {
             trades: extracted.flatMap(s => s.tax.trades), unrealized: extracted.flatMap(s => s.tax.unrealized),
             dividends: extracted.flatMap(s => s.tax.dividends), dividendWithheld: extracted.flatMap(s => s.tax.dividendWithheld),
             interest: extracted.flatMap(s => s.tax.interest), interestWithheld: extracted.flatMap(s => s.tax.interestWithheld),
@@ -370,20 +399,67 @@ export function extractSeries(statements: any[]): PerformanceSeries {
     return { ...merged, warnings: [...warnings] };
 }
 
+/** Executions and the closed lots they produced share account, instrument, time and side. */
+const lotKey = (row: any) => JSON.stringify([String(row.accountId ?? ''), String(row.conid || row.symbol || ''),
+    String(row.dateTime ?? row.tradeDate ?? ''), String(row.buySell ?? '').toUpperCase()]);
+
+/** Closed lots: `<Lot>` elements of real reports, `<Trade levelOfDetail="CLOSED_LOT">` elsewhere. */
+function closedLotRows(stmt: any): any[] {
+    return [...asArray<any>(stmt.Trades?.Lot), ...asArray<any>(stmt.Trades?.Trade)]
+        .filter(row => row && typeof row === 'object' && String(row.levelOfDetail).toUpperCase() === 'CLOSED_LOT');
+}
+
+const compactDate = (value: unknown) => String(value ?? '').replace(/-/g, '').slice(0, 8);
+
+/** Latest rate on or before the date, at most a week old (weekends, holidays). */
+function rateOnOrBefore(table: Record<string, number> | undefined, date: string): number | undefined {
+    if (!table || !/^\d{8}$/.test(date)) return undefined;
+    const day = Date.UTC(+date.slice(0, 4), +date.slice(4, 6) - 1, +date.slice(6, 8));
+    for (let back = 0; back <= 7; back++) {
+        const rate = table[new Date(day - back * 86400000).toISOString().slice(0, 10).replaceAll('-', '')];
+        if (rate > 0) return rate;
+    }
+    return undefined;
+}
+
+/** Rate of the last day each month has in the table. */
+function monthEndRates(table: Record<string, number>): Record<string, number> {
+    const out: Record<string, { date: string; rate: number }> = {};
+    for (const [date, rate] of Object.entries(table)) {
+        const month = date.slice(0, 6);
+        if (!out[month] || date > out[month].date) out[month] = { date, rate };
+    }
+    return Object.fromEntries(Object.entries(out).map(([month, { rate }]) => [month, rate]));
+}
+
+interface ParsedExecution {
+    row: any;
+    date: string;
+    fx: number;
+    isClose: boolean;
+    pnl: number;       // v bázové měně
+    proceeds: number;  // v bázové měně, se znaménkem
+    quantity: number;
+}
+
 /**
  * P/L bereme jednou z EXECUTION. Hrubé příjmy zahrnují i otevírací prodeje
  * (například vypsané opce); nákup zavírající short není další příjem.
  *
+ * Když výpis obsahuje Closed Lots, rozdělí se uzavírací obchod na loty: každý
+ * nese své datum nabytí (časový test) a nákupní cenu v měně instrumentu, ze
+ * které taxFx.ts spočítá český přepočet kurzem dne nákupu. Loty, které
+ * nesouhlasí s obchodem, se nepoužijí a obchod zůstane celý.
+ *
  * Doba držení musí pocházet z brokerova data nabytí. FIFO rekonstrukce pouze
  * uvnitř okna reportu nemůže vyloučit starší počáteční loty a vážený průměr
  * stáří nedokáže rozhodnout o osvobození jednotlivých lotů. Když datum chybí,
- * necháme je neznámé. Brokerovo P/L zůstává orientačním daňovým podkladem.
+ * necháme je neznámé.
  */
-export function extractRealizedTrades(stmt: any): RealizedTrade[] {
+export function extractRealizedTrades(stmt: any, rateOn?: (currency: string, date: string) => number | undefined): RealizedTrade[] {
     const baseCurrency = String(stmt.AccountInformation?.currency ?? stmt.currency ??
         asArray<any>(stmt.EquitySummaryInBase?.EquitySummaryByReportDateInBase)[0]?.currency ?? '');
-    const compactDate = (value: unknown) => String(value ?? '').replace(/-/g, '').slice(0, 8);
-    const out: RealizedTrade[] = [];
+    const parsed: ParsedExecution[] = [];
     for (const row of asArray<any>(stmt.Trades?.Trade)) {
         if (String(row.levelOfDetail).toUpperCase() !== TAX_TRADE_LEVEL) continue;
         const date = compactDate(row.tradeDate ?? row.dateTime);
@@ -401,6 +477,68 @@ export function extractRealizedTrades(stmt: any): RealizedTrade[] {
         const proceeds = Number(rawProceeds) * fx;
         const quantity = Number(row.quantity);
         if (![pnl, proceeds, quantity].every(Number.isFinite)) throw new Error('Obchod obsahuje neplatnou číselnou hodnotu.');
+        parsed.push({ row, date, fx, isClose, pnl, proceeds, quantity });
+    }
+
+    const lotsByKey = new Map<string, any[]>();
+    for (const lot of closedLotRows(stmt)) lotsByKey.set(lotKey(lot), [...(lotsByKey.get(lotKey(lot)) ?? []), lot]);
+    const closingByKey = new Map<string, ParsedExecution[]>();
+    for (const e of parsed) if (e.isClose) closingByKey.set(lotKey(e.row), [...(closingByKey.get(lotKey(e.row)) ?? []), e]);
+
+    /** Partial fills in the same second share their lots; split the group by lot. */
+    function lotTrades(group: ParsedExecution[], lots: any[] | undefined): RealizedTrade[] | null {
+        if (!lots?.length) return null;
+        const { date, fx } = group[0];
+        if (group.some(e => e.date !== date || e.fx !== fx)) return null;
+        const currency = String(group[0].row.currency ?? '');
+        const items = lots.map(lot => ({ quantity: Number(lot.quantity), pnl: Number(lot.fifoPnlRealized),
+            cost: Number(lot.cost), openDate: compactDate(lot.openDateTime) }));
+        if (items.some(l => ![l.quantity, l.pnl, l.cost].every(Number.isFinite) || l.quantity === 0 ||
+            !Number.isFinite(daysBetween(l.openDate, date)))) return null;
+        const groupQuantity = group.reduce((sum, e) => sum + Math.abs(e.quantity), 0);
+        const lotQuantity = items.reduce((sum, l) => sum + Math.abs(l.quantity), 0);
+        const groupPnl = group.reduce((sum, e) => sum + Number(e.row.fifoPnlRealized), 0);
+        const lotPnl = items.reduce((sum, l) => sum + l.pnl, 0);
+        if (!(groupQuantity > 0) || lotQuantity > groupQuantity + 1e-9 ||
+            Math.abs(groupPnl - lotPnl) > 0.01 * (group.length + items.length)) return null;
+        const proceeds = group.reduce((sum, e) => sum + Math.max(0, e.proceeds), 0);
+        const assetCategory = String(group[0].row.assetCategory ?? '');
+        const openFxOf = (openDate: string) => currency === baseCurrency ? 1 : rateOn?.(currency, openDate);
+        const out: RealizedTrade[] = items.map(l => {
+            const short = l.quantity < 0;
+            const holding = daysBetween(l.openDate, date);
+            const openFx = openFxOf(l.openDate);
+            return { date, assetCategory, pnl: l.pnl * fx, proceeds: proceeds * Math.abs(l.quantity) / groupQuantity,
+                holdingDays: !short && holding >= 0 ? holding : null,
+                ...(!short && holding >= 0 ? { acquiredDate: l.openDate } : {}),
+                ...(short ? { exemptionEligible: false } : {}),
+                lot: { currency, pnl: l.pnl, cost: l.cost, openDate: l.openDate, closeFx: fx, ...(openFx ? { openFx } : {}) },
+            };
+        });
+        // An execution that closes and opens at once (C;O) keeps its opening part.
+        const restQuantity = groupQuantity - lotQuantity;
+        const restPnl = group.reduce((sum, e) => sum + e.pnl, 0) - lotPnl * fx;
+        if (restQuantity > 1e-9 || Math.abs(restPnl) > 0.01) {
+            out.push({ date, assetCategory, pnl: restPnl, proceeds: proceeds * restQuantity / groupQuantity,
+                holdingDays: null, exemptionEligible: false });
+        }
+        return out;
+    }
+
+    const out: RealizedTrade[] = [];
+    const handled = new Set<string>();
+    for (const e of parsed) {
+        const { row, date, isClose, pnl, proceeds, quantity } = e;
+        if (isClose) {
+            const key = lotKey(row);
+            if (handled.has(key)) continue;
+            const split = lotTrades(closingByKey.get(key)!, lotsByKey.get(key));
+            if (split) {
+                handled.add(key);
+                out.push(...split);
+                continue;
+            }
+        }
         if (!isClose && pnl === 0 && proceeds <= 0) continue;
         const acquired = compactDate(row.openDateTime);
         const holding = daysBetween(acquired, date);
@@ -422,7 +560,8 @@ export function extractRealizedTrades(stmt: any): RealizedTrade[] {
  * never both. An incomplete breakdown must not silently lower liquidation tax.
  * https://www.ibkrguides.com/reportingreference/reportguide/open%20positionsfq.htm
  */
-export function extractUnrealizedPositions(positions: any[], currency: string, snapshotDate: string): RealizedTrade[] {
+export function extractUnrealizedPositions(positions: any[], currency: string, snapshotDate: string,
+    rateOn?: (currency: string, date: string) => number | undefined): RealizedTrade[] {
     const groups = new Map<string, { summary: any[]; lots: any[] }>();
     for (const row of positions) {
         const level = String(row.levelOfDetail).toUpperCase();
@@ -467,12 +606,22 @@ export function extractUnrealizedPositions(positions: any[], currency: string, s
             const acquired = String(row.openDateTime ?? '').replaceAll('-', '').slice(0, 8);
             const holding = daysBetween(acquired, date);
             const short = quantity < 0 || value < 0 || String(row.side).toUpperCase() === 'SHORT';
-            const knownHolding = !short && String(row.levelOfDetail).toUpperCase() === 'LOT' &&
-                Number.isFinite(holding) && holding >= 0;
+            const isLot = String(row.levelOfDetail).toUpperCase() === 'LOT';
+            const knownHolding = !short && isLot && Number.isFinite(holding) && holding >= 0;
+            // Lot cost in the instrument currency allows the Czech purchase-day conversion.
+            const instrumentCurrency = String(row.currency ?? '');
+            const localPnl = Number(row.fifoPnlUnrealized);
+            const localCost = Number(row.costBasisMoney);
+            const closeFx = instrumentCurrency === currency ? 1 : Number(row.fxRateToBase);
+            const openFx = instrumentCurrency === currency ? 1 : rateOn?.(instrumentCurrency, acquired);
+            const lot = isLot && Number.isFinite(holding) && holding >= 0 && [localPnl, localCost].every(Number.isFinite) && closeFx > 0
+                ? { currency: instrumentCurrency, pnl: localPnl, cost: localCost, openDate: acquired, closeFx, ...(openFx ? { openFx } : {}) }
+                : undefined;
             out.push({ date, assetCategory: String(row.assetCategory ?? ''), pnl, proceeds: Math.max(0, value),
                 holdingDays: knownHolding ? holding : null,
                 ...(knownHolding ? { acquiredDate: acquired } : {}),
                 ...(short ? { exemptionEligible: false } : {}),
+                ...(lot ? { lot } : {}),
             });
         }
     }

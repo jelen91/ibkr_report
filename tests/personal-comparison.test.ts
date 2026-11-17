@@ -180,3 +180,22 @@ test('positions held at the start are reported, because broker P/L counts them f
     smallStart.flows = [];
     assert.equal(computePersonalComparison(smallStart, benchmark).carriedPositions, 0);
 });
+
+test('the cheaper legal FX method is used, while the breakdown shows the gain at each day\'s rate', () => {
+    const { series, benchmark } = fixture();
+    // 1 000 USD gain on a 10 000 USD purchase at 20 CZK/USD, sold at 22 CZK/USD.
+    series.tax.trades.push({ date: '20260601', assetCategory: 'STK', pnl: 22_000, proceeds: 242_000, holdingDays: 120,
+        acquiredDate: '20260201', lot: { currency: 'USD', pnl: 1_000, cost: 10_000, openDate: '20260201', closeFx: 22, openFx: 20 } });
+    series.monthEndFx = { USD: Object.fromEntries(['01', '02', '03', '04', '05', '06', '07', '08', '09'].map(m => [`2026${m}`, 21])) };
+    const view = computePersonalComparison(series, benchmark);
+    assert.equal(view.fx.method, 'uniform');
+    assert.equal(view.fx.alternative, 'daily');
+    near(view.fx.investmentTax.daily, (100_000 + 42_000) * 0.15);
+    near(view.fx.investmentTax.uniform, (100_000 + 21_000) * 0.15);
+    near(view.result.trading.investmentTax, view.fx.investmentTax.uniform);
+    // September has not ended by 16.9., so eight month-ends form the estimate.
+    assert.deepEqual(view.fx.uniformRates, [{ year: 2026, currency: 'USD', rate: 21, official: false, months: 8 }]);
+    assert.equal(view.fx.lots, 1);
+    assert.equal(view.fx.openPositionsWithoutLots, 1);
+    near(view.tradingSources.realized.securities, 42_000);
+});

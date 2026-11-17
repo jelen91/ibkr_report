@@ -7,6 +7,7 @@ import type { Account } from '../types';
 import { mergeNavSeries } from '../lib/twr';
 import { mergeCashBalances, sumByDate } from '../lib/cash';
 import { computePersonalComparison, type PersonalBenchmark, type PersonalSeries } from '../lib/personalComparison';
+import { mergeMonthEndFx } from '../lib/taxFx';
 
 interface PerformanceSeries extends PersonalSeries { accountIds: string[] }
 const PORTFOLIO_COLOR = '#38bdf8';
@@ -36,6 +37,7 @@ function mergeSeries(list: PerformanceSeries[]): PerformanceSeries | null {
         warnings: [...new Set(list.flatMap(s => s.warnings ?? []))],
         cashByCurrency: mergeCashBalances(list.map(s => s.cashByCurrency)),
         nonCashByDate: sumByDate(list.map(s => s.nonCashByDate), combined.nav.map(n => n.date)),
+        monthEndFx: mergeMonthEndFx(list.map(s => s.monthEndFx)),
         // Daňové vstupy se slučují prostým spojením — základ daně je jeden
         // za poplatníka, ne za účet.
         tax: {
@@ -175,7 +177,7 @@ export default function PerformancePage() {
 type Comparison = ReturnType<typeof computePersonalComparison>;
 
 function ComparisonView({ view, warnings }: { view: Comparison; warnings: string[] }) {
-    const { result, index, tradingSources: src, taxDetail } = view;
+    const { result, index, tradingSources: src, taxDetail, fx } = view;
     const grossGap = result.trading.gross - result.passive.gross;
     const opening = `Hodnota k ${fmtDate(view.startDate)}`;
     const recent = view.gapRows.slice(-5);
@@ -184,6 +186,14 @@ function ComparisonView({ view, warnings }: { view: Comparison; warnings: string
     const usdCash = view.cash?.find(row => row.currency === 'USD');
     const trading = taxDetail?.trading;
     const lostBasket = (gain: number) => gain < 0 ? 'ztráta — nezdaňuje se a model ji nezapočítává proti jiným druhům obchodů' : undefined;
+    const uniformYears = [...new Set(fx.uniformRates.map(row => row.year))];
+    const uniformText = uniformYears.map(y => {
+        const rows = fx.uniformRates.filter(row => row.year === y);
+        const estimated = rows.find(row => !row.official);
+        return `Jednotný kurz ${y}: ${rows.map(row => `${row.currency} ${fxRate(row.rate)}`).join(', ')}${estimated
+            ? ` (odhad z kurzů IBKR ke konci ${estimated.months} ${estimated.months === 1 ? 'měsíce' : 'měsíců'}, GFŘ ho vyhlásí po skončení roku)` : ' (GFŘ)'}.`;
+    }).join(' ');
+    const fxHint = `Zákon dovoluje denní kurzy, nebo jednotný roční kurz; zvolený způsob musí v přiznání platit pro všechny příjmy v cizí měně. Model použil výhodnější. Daň z investic denními kurzy ${money(fx.investmentTax.daily)}, jednotným kurzem ${money(fx.investmentTax.uniform)}. ${uniformText}`;
 
     return <>
         <p className="subtext">Rok {view.year} · data k {fmtDate(view.lastDate)} · stejné vklady a výběry · vše v Kč</p>
@@ -241,7 +251,7 @@ function ComparisonView({ view, warnings }: { view: Comparison; warnings: string
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 380px), 1fr))', gap: 16 }}>
             <Section title="Z čeho je zisk tradingu">
                 <table style={tableStyle}><tbody>
-                    <Row label="Realizované obchody — akcie a ETF" value={signedMoney(src.realized.securities)} />
+                    <Row label="Realizované obchody — akcie a ETF" hint={fx.lots > 0 ? 'Prodej v korunách minus nákup v korunách, každý kurzem svého dne.' : undefined} value={signedMoney(src.realized.securities)} />
                     <Row label="Realizované obchody — opce a deriváty" value={signedMoney(src.realized.derivatives)} />
                     {Math.round(src.realized.other) !== 0 && <Row label="Realizované obchody — ostatní" value={signedMoney(src.realized.other)} />}
                     <Row label="Otevřené pozice — akcie a ETF" hint="Nerealizovaný zisk/ztráta od nákupu." value={signedMoney(src.unrealized.securities)} />
@@ -283,6 +293,7 @@ function ComparisonView({ view, warnings }: { view: Comparison; warnings: string
                     {Math.round(trading.otherGain) !== 0 && <Row label="Základ — ostatní" hint={lostBasket(trading.otherGain)} value={signedMoney(trading.otherGain)} />}
                     <Row label="Dividendy (hrubé)" value={money(trading.dividends)} />
                     <Row label="Úroky (hrubé)" value={money(trading.interest)} />
+                    {fx.lots > 0 && <Row label="Přepočet cizích měn" hint={fxHint} value={fx.method === 'uniform' ? 'jednotný kurz' : 'denní kurzy'} />}
                     <Row label="Česká daň z investic" hint={`Po zahraničním zápočtu ${money(result.annual.find(row => row.year === String(view.year))?.trading.foreignCredit ?? 0)}.`} value={money(result.trading.investmentTax)} strong />
                     <Row label="Příjmy, které se počítají do limitu paušálu" hint={`Hrubé prodeje, dividendy a úroky. Limit je 50 000 Kč, ${trading.flatTaxIncome > 50_000 ? 'je překročen, takže paušál pro tento rok neplatí' : 'není překročen'}.`} value={money(trading.flatTaxIncome)} />
                     {result.trading.regimeCost !== 0 && <>
@@ -294,6 +305,15 @@ function ComparisonView({ view, warnings }: { view: Comparison; warnings: string
                     <Row label="Ztráta paušálního režimu" value={money(result.trading.regimeCost)} strong />
                     <Row label="Náklady tradingu celkem" value={money(result.trading.totalCost)} highlight />
                 </tbody></table> : <p>Rozpad daně pro rok {view.year} není k dispozici.</p>}
+                {trading && fx.lots === 0 && <p className="subtext" style={{ marginBottom: 0, color: '#f59e0b' }}>
+                    Výpis nemá nákupní loty, takže základ vychází z brokerova zisku přepočteného kurzem dne prodeje. Česká daň počítá nákup kurzem dne nákupu. Pro přesný výpočet zapni ve Flex query u Trades úroveň Closed Lots.
+                </p>}
+                {trading && fx.lots > 0 && fx.openPositionsWithoutLots > 0 && <p className="subtext" style={{ marginBottom: 0, color: '#f59e0b' }}>
+                    Otevřené pozice ve výpisu nemají loty, takže se při jejich uzavření počítá i nákupní cena dnešním kurzem. Pro přesný výpočet zapni ve Flex query u Open Positions úroveň Lot.
+                </p>}
+                {trading && fx.missingPurchaseFx > 0 && <p className="subtext" style={{ marginBottom: 0, color: '#f59e0b' }}>
+                    U {fx.missingPurchaseFx} lotů nákup proběhl před začátkem výpisu a chybí kurz ke dni nákupu; při denních kurzech u nich zůstává brokerův zisk přepočtený kurzem dne prodeje.
+                </p>}
                 {trading && view.carriedPositions !== 0 && <p className="subtext" style={{ marginBottom: 0, color: '#f59e0b' }}>
                     Daň z uzavření pozic počítá zisk od nákupu, tedy i z doby před {fmtDate(view.startDate)}. Indexová varianta začíná nákupem k tomuto dni a tuto daň nenese, takže loňský zisk pozic zhoršuje a loňská ztráta zlepšuje výsledek tradingu.
                 </p>}
@@ -386,13 +406,16 @@ function ComparisonView({ view, warnings }: { view: Comparison; warnings: string
             <summary style={summaryStyle}>Jak se výsledek počítá</summary>
             <p>Porovnávám uzavření tvých IBKR pozic s dlouhodobým držením S&P 500 přes akumulační ETF typu CSPX. Obě varianty začínají stejnou hodnotou a mají stejné vklady i výběry. Index se na konci neprodává a jeho hodnota se bere ke stejnému datu výpisu: závěrečná cena SPY v New Yorku s dividendami reinvestovanými po 15% srážce × kurz USD/CZK z IBKR.</p>
             <p>Daň z uzavřených obchodů a případný přechod do běžného režimu OSVČ jsou započítané. Zahraniční srážky, které už jsou v hodnotě účtu, se neodečítají podruhé. Z dostupných ročních způsobů zdanění dividend se automaticky použije ten výhodnější. Neověřené vrácení zahraniční daně se nepřičítá.</p>
+            <p>Nákup i prodej v cizí měně se přepočítá na koruny buď kurzem svého dne, nebo jednotným ročním kurzem. Spočítají se obě varianty a použije se ta, u které vychází trading levněji. Kurzy jsou z IBKR, ne z ČNB, takže se od přiznání mohou nepatrně lišit.</p>
             <p>Akcie a deriváty jsou v modelu oddělené koše: ztráta v jednom se nezapočítává proti zisku v druhém. Jestli to tak platí i pro tvé přiznání, je potřeba ověřit s daňovým poradcem.</p>
             <p>Budoucí růst indexu ani budoucí prodej se neodhaduje. Případné prodeje kvůli výběrům peněz se daní i u indexu.</p>
         </details>
 
         <details className="card" style={{ marginTop: 16 }}>
             <summary style={summaryStyle}>Podklady a přesnost odhadu</summary>
-            <p>Model používá brokerovo P/L. Přesný český daňový přepočet nákupů a prodejů, opční přiřazení a chybějící data nabytí mohou částku daně změnit. Nezahrnuje další investice a příjmy mimo tento výpis.</p>
+            <p>{fx.lots > 0
+                ? 'Zisk z obchodů se počítá z nákupních lotů IBKR. Kurzy IBKR místo kurzů ČNB, opční přiřazení a dividendy a úroky přepočtené denními kurzy i při jednotném kurzu mohou částku daně mírně změnit.'
+                : 'Model používá brokerovo P/L. Přesný český daňový přepočet nákupů a prodejů, opční přiřazení a chybějící data nabytí mohou částku daně změnit.'} Nezahrnuje další investice a příjmy mimo tento výpis.</p>
             <ul>{warnings.map(warning => <li key={warning}>{warning}</li>)}</ul>
         </details>
     </>;

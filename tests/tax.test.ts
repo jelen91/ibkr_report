@@ -111,3 +111,18 @@ test('benchmark value and calendar-time exemption use the same rules', () => {
     assert.equal(benchmarkTax({ startValue: 50_000, endValueBeforeCapitalTax: 90_000, sold: true, holdingDays: 10, settings: DEFAULT_TAX_SETTINGS }), 0);
     assert.equal(benchmarkTax({ startValue: 100_000, endValueBeforeCapitalTax: 150_000, sold: true, holdingDays: 1095, acquiredDate: '20220301', disposalDate: '20250301', settings: DEFAULT_TAX_SETTINGS }), 7_500);
 });
+
+test('the tax notes say which items lack purchase lots instead of claiming broker P/L everywhere', () => {
+    const lot = { currency: 'USD', pnl: 10, cost: 100, openDate: '20260201', closeFx: 22, openFx: 20 };
+    const inputs = {
+        trades: [{ date: '20260601', assetCategory: 'STK', pnl: 220, proceeds: 2420, holdingDays: 120, lot }],
+        unrealized: [{ date: '20260901', assetCategory: 'STK', pnl: -50, proceeds: 500, holdingDays: null }],
+        dividends: [], dividendWithheld: [], interest: [], interestWithheld: [],
+    };
+    const [year] = computeTax(inputs, { ...DEFAULT_TAX_SETTINGS, liquidate: true });
+    assert.ok(year.warnings.some(w => w.startsWith('Nákupy i prodeje jsou přepočtené kurzy IBKR')));
+    assert.ok(year.warnings.some(w => w.startsWith('Otevřené pozice nemají ve výpisu loty')));
+    assert.ok(!year.warnings.some(w => w.startsWith('Model používá brokerovo P/L')));
+    const [broker] = computeTax({ ...inputs, trades: [{ ...inputs.trades[0], lot: undefined }] }, DEFAULT_TAX_SETTINGS);
+    assert.ok(broker.warnings.some(w => w.startsWith('Model používá brokerovo P/L')));
+});

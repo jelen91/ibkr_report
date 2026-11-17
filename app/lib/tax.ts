@@ -27,6 +27,17 @@ export interface RealizedTrade {
     holdingDays: number | null; // null = dobu držení se nepodařilo dohledat
     acquiredDate?: string;   // skutečné datum nabytí celého prodávaného lotu
     exemptionEligible?: boolean; // false např. u krátkého prodeje
+    /** Lot s nákupní cenou v měně instrumentu; umožní český přepočet (viz taxFx.ts). */
+    lot?: TaxLot;
+}
+
+export interface TaxLot {
+    currency: string;   // měna instrumentu
+    pnl: number;        // brokerovo P/L lotu v měně instrumentu
+    cost: number;       // pořizovací cena lotu v měně instrumentu (záporná u shortu = přijatá prémie)
+    openDate: string;   // YYYYMMDD, den otevření
+    closeFx: number;    // kurz do bázové měny ke dni uzavření nebo ocenění
+    openFx?: number;    // kurz ke dni otevření; chybí, když je mimo období výpisu
 }
 
 export interface CashItem {
@@ -233,8 +244,9 @@ const hasTests = (key: TaxBucketKey, date: string) =>
 // https://financnisprava.gov.cz/cs/financni-sprava/media-a-verejnost/tiskove-zpravy-gfr/tiskove-zpravy-2026/danove-novinky-pro-rok-2026
 
 /**
- * Orientační model v CZK z brokerova P/L. Neprovádí české přepočty nákupních
- * a prodejních cen ani rekonstrukci opčních přiřazení. Chybějící zahraniční
+ * Orientační model v CZK z P/L obchodů tak, jak je dostane: český přepočet
+ * nákupních cen dělá předem taxFx.ts. Neprovádí rekonstrukci opčních
+ * přiřazení. Chybějící zahraniční
  * smluvní limit zápočtu se nesmí nahradit automatickým zápočtem celé srážky.
  */
 export function computeTax(inputs: TaxInputs, settings: TaxSettings, upToDate?: string): TaxYearResult[] {
@@ -258,11 +270,21 @@ export function computeTax(inputs: TaxInputs, settings: TaxSettings, upToDate?: 
         return r;
     };
     const positions = settings.liquidate ? [...inputs.trades, ...inputs.unrealized] : inputs.trades;
+    // Which priced items lack a purchase lot, separately for closed trades and open positions.
+    const lotCoverage = new Map<string, { lots: number; closedWithout: number; openWithout: number }>();
+    const openItems = new Set(inputs.unrealized);
     for (const t of positions) {
         if (!within(t.date)) continue;
         finiteAmount(t.pnl);
         finiteAmount(t.proceeds);
         const y = yearFor(t.date);
+        if (t.pnl !== 0) {
+            const coverage = lotCoverage.get(y.year) ?? { lots: 0, closedWithout: 0, openWithout: 0 };
+            if (t.lot) coverage.lots++;
+            else if (openItems.has(t)) coverage.openWithout++;
+            else coverage.closedWithout++;
+            lotCoverage.set(y.year, coverage);
+        }
         const trades = positionsByYear.get(y.year) ?? [];
         trades.push({ ...t, date: dateKey(t.date), proceeds: Math.max(0, t.proceeds) });
         positionsByYear.set(y.year, trades);
@@ -287,7 +309,12 @@ export function computeTax(inputs: TaxInputs, settings: TaxSettings, upToDate?: 
 
     for (const year of years.values()) {
         const trades = positionsByYear.get(year.year) ?? [];
-        if (trades.length) year.warnings.push('Model používá brokerovo P/L, nikoli české pořizovací a prodejní ceny s daňovými kurzy. Nezná investice mimo tento report.');
+        const coverage = lotCoverage.get(year.year);
+        if (coverage?.lots) {
+            year.warnings.push('Nákupy i prodeje jsou přepočtené kurzy IBKR, ne kurzy ČNB. Model nezná investice mimo tento report.');
+            if (coverage.closedWithout) year.warnings.push('Část uzavřených obchodů nemá ve výpisu nákupní lot nebo jeho kurz; u nich model používá brokerovo P/L přepočtené kurzem dne prodeje.');
+            if (coverage.openWithout) year.warnings.push('Otevřené pozice nemají ve výpisu loty, takže se jejich nákupní cena přepočítává dnešním kurzem. Ve Flex query u Open Positions zapni úroveň Lot.');
+        } else if (trades.length) year.warnings.push('Model používá brokerovo P/L, nikoli české pořizovací a prodejní ceny s daňovými kurzy. Nezná investice mimo tento report.');
         if (trades.some(t => bucketOf(t.assetCategory) === 'derivatives')) {
             year.warnings.push('U derivátů je nutné ověřit časové zařazení prémií, přiřazení a uplatnění opcí; brokerův okamžik realizace se může lišit od daňového.');
         }

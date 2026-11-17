@@ -3,6 +3,7 @@ import { bucketOf, getTaxYearRules, selfEmployedTaxBase, TAXPAYER_CREDIT, TRADES
 import { assignFlowLandingDays, benchmarkInCurrency, computeTwr, type FlowPoint, type NavPoint } from './twr';
 import type { CashBalance } from './cash';
 import { FUND_DIVIDEND_WITHHOLDING, netTotalReturn } from './benchmarkData';
+import { applyFxMethod, type FxMethod } from './taxFx';
 
 export interface PersonalSeries {
     currency: string;
@@ -17,6 +18,8 @@ export interface PersonalSeries {
     cashByCurrency?: CashBalance[];
     /** NAV without cash and accruals per day; tells whether positions were held at the start. */
     nonCashByDate?: Record<string, number>;
+    /** Month-end rates of lot currencies for the uniform-rate method. */
+    monthEndFx?: Record<string, Record<string, number>>;
 }
 export interface PersonalBenchmark {
     symbol: string;
@@ -92,12 +95,36 @@ export function computePersonalComparison(series: PersonalSeries, benchmark: Per
             flatTaxRegime: true, flatTaxMonthly: rules.flatTaxMonthly, taxpayerCredit: TAXPAYER_CREDIT,
         } satisfies AfterTaxYearSettings];
     }));
-    const result = computeAfterTaxComparison({
-        nav: series.nav, flows: series.flows, fxToUsd: series.fxToUsd, tax: series.tax,
-        prices: fund, dividends: {}, from: startDate, to: lastDate,
-        distributing: false, liquidationMode: 'ibkr', annualSettings,
-        foreignCredit: 'dividends15', foreignIncomeMode: 'auto',
+    // The law offers daily rates or the uniform annual rate for the whole
+    // return. Like the dividend regime, use the one that costs the trader less.
+    const methods = (['daily', 'uniform'] as FxMethod[]).map(method => {
+        const conversion = applyFxMethod(series.tax, method, series.monthEndFx, lastDate, series.currency);
+        return { method, conversion, result: computeAfterTaxComparison({
+            nav: series.nav, flows: series.flows, fxToUsd: series.fxToUsd, tax: conversion.tax,
+            prices: fund, dividends: {}, from: startDate, to: lastDate,
+            distributing: false, liquidationMode: 'ibkr', annualSettings,
+            foreignCredit: 'dividends15', foreignIncomeMode: 'auto',
+        }) };
     });
+    const [chosen, alternative] = methods[1].result.trading.totalCost < methods[0].result.trading.totalCost - 0.5
+        ? [methods[1], methods[0]] : [methods[0], methods[1]];
+    const { result } = chosen;
+    const lotsInPeriod = [...series.tax.trades.filter(item => item.date > startDate && item.date <= lastDate),
+        ...series.tax.unrealized.filter(item => item.date === lastDate)];
+    const foreign = lotsInPeriod.filter(item => item.lot && item.lot.currency !== series.currency);
+    const openPriced = series.tax.unrealized.filter(item => item.date === lastDate && Math.round(item.pnl) !== 0);
+    const fx = {
+        method: chosen.method,
+        investmentTax: Object.fromEntries(methods.map(m => [m.method, m.result.trading.investmentTax])) as Record<FxMethod, number>,
+        totalCost: Object.fromEntries(methods.map(m => [m.method, m.result.trading.totalCost])) as Record<FxMethod, number>,
+        alternative: alternative.method,
+        uniformRates: methods[1].conversion.uniformRates.filter(row => row.year === year || foreign.some(item => item.lot!.openDate.startsWith(String(row.year)))),
+        /** Lots with a purchase price; without any, both methods equal broker P/L. */
+        lots: lotsInPeriod.filter(item => item.lot).length,
+        missingPurchaseFx: foreign.filter(item => item.lot!.openFx === undefined).length,
+        /** Open positions without lots are converted at today's rate including their cost. */
+        openPositionsWithoutLots: openPriced.filter(item => !item.lot).length,
+    };
     const periodFlows = Object.entries(landed).filter(([date]) => date > startDate && date <= lastDate)
         .sort(([a], [b]) => a.localeCompare(b));
     const netContributions = periodFlows.reduce((sum, [, amount]) => sum + amount, 0);
@@ -154,8 +181,10 @@ export function computePersonalComparison(series: PersonalSeries, benchmark: Per
         return out;
     };
     const tradingGross = result.trading.gross - opening.nav - netContributions;
-    const realized = byBucket(series.tax.trades.filter(item => inPeriod(item.date)));
-    const unrealized = byBucket(series.tax.unrealized.filter(item => item.date === lastDate));
+    // Purchases at their own day's rate: the gain in koruny as the NAV measures it.
+    const economic = methods[0].conversion.tax;
+    const realized = byBucket(economic.trades.filter(item => inPeriod(item.date)));
+    const unrealized = byBucket(economic.unrealized.filter(item => item.date === lastDate));
     const dividends = sum(series.tax.dividends.filter(item => inPeriod(item.date)), item => item.amount);
     const withheld = sum([...series.tax.dividendWithheld, ...series.tax.interestWithheld].filter(item => inPeriod(item.date)), item => item.amount);
     const interestItems = series.tax.interest.filter(item => inPeriod(item.date));
@@ -193,7 +222,7 @@ export function computePersonalComparison(series: PersonalSeries, benchmark: Per
                 passive: moneyWeightedReturn(passiveGross, opening.nav, periodFlows, startDate, lastDate),
             },
         },
-        index, tradingSources,
+        index, tradingSources, fx,
         /** Value of positions held at the start; 0 = none, null = unknown but the opening NAV is material. */
         carriedPositions,
         cash: series.cashByCurrency?.map(row => ({ ...row, share: row.value / result.trading.gross })) ?? null,
