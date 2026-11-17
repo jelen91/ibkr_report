@@ -10,7 +10,8 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { isValidYmd, mergeNavSeries, type NavPoint, type FlowPoint } from './twr';
-import type { TaxInputs, RealizedTrade } from './tax';
+import { TRADES_WITHOUT_EXECUTION_WARNING, type TaxInputs, type RealizedTrade } from './tax';
+import { mergeCashBalances, sumByDate, type CashBalance } from './cash';
 
 const SEND_URL = 'https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/SendRequest';
 const PICKUP_URL = 'https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService/GetStatement';
@@ -28,7 +29,7 @@ const EXTERNAL_FLOW_CODES = new Set(['DEP', 'WITH']);
 // vstoupily do základu dvakrát.
 const TAX_TRADE_LEVEL = 'EXECUTION';
 
-const CACHE_SCHEMA_VERSION = 3;
+const CACHE_SCHEMA_VERSION = 5;
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const CACHE_DIR = path.join(process.cwd(), 'data');
 
@@ -47,6 +48,10 @@ export interface PerformanceSeries {
     flows: FlowPoint[];                  // vklady/výběry
     fxToUsd: Record<string, number>;     // YYYYMMDD → kolik bázové měny za 1 USD
     tax: TaxInputs;                      // podklady pro odhad daně
+    /** Hotovost podle měn k poslednímu dni (sekce FxPositions); chybí, když sekce není zapnutá. */
+    cashByCurrency?: CashBalance[];
+    /** NAV bez hotovosti a naběhlých úroků/dividend po dnech; chybí, když NAV nemá sloupec cash. */
+    nonCashByDate?: Record<string, number>;
     fetchedAt: number;
     schemaVersion: number;
     warnings: string[];
@@ -209,6 +214,9 @@ export function extractSeries(statements: any[]): PerformanceSeries {
         const trades: any[] = [];
         let latestPositionDate = '';
         let positions: any[] = [];
+        let fxPositions: any[] | undefined;
+        const nonCashByDate: Record<string, number> = {};
+        let nonCashComplete = true;
 
         // Repeated query periods must not duplicate an account's transactions.
         // Keep identical, ID-less rows within one statement: two equal deposits
@@ -258,6 +266,9 @@ export function extractSeries(statements: any[]): PerformanceSeries {
                 const prior = navByDate.get(date);
                 if (prior !== undefined && Math.abs(prior - total) > 1e-8) throw new Error(`Výpisy obsahují rozdílné NAV k ${date}.`);
                 navByDate.set(date, total);
+                const cash = row.cash;
+                if (cash === undefined || cash === null || String(cash).trim() === '' || !Number.isFinite(Number(cash))) nonCashComplete = false;
+                else nonCashByDate[date] = total - Number(cash) - (Number(row.interestAccruals) || 0) - (Number(row.dividendAccruals) || 0);
             }
             if (stmt.StmtFunds === undefined) throw new Error('Ve Flex query chybí Statement of Funds; bez vkladů a výběrů nelze výnos ověřit.');
             const funds = uniqueRows(stmt, 'StmtFunds', 'StatementOfFundsLine');
@@ -294,6 +305,11 @@ export function extractSeries(statements: any[]): PerformanceSeries {
                 flowByDate.set(date, (flowByDate.get(date) ?? 0) + value);
             }
             if (stmt.Trades === undefined) warnings.add('Chybí sekce Trades; odhad daně nezahrnuje realizované obchody.');
+            const tradeRows = Object.values<any>(stmt.Trades && typeof stmt.Trades === 'object' ? stmt.Trades : {})
+                .flatMap(value => asArray<any>(value)).filter(row => row && typeof row === 'object');
+            if (tradeRows.length && !tradeRows.some(row => String(row.levelOfDetail).toUpperCase() === TAX_TRADE_LEVEL)) {
+                warnings.add(TRADES_WITHOUT_EXECUTION_WARNING);
+            }
             if (stmt.OpenPositions === undefined) warnings.add('Chybí sekce Open Positions; nelze modelovat daň při likvidaci.');
             // Order summaries and closed lots describe the same executions.
             // Multiple closed lots can share a trade ID, so do not even run
@@ -304,6 +320,7 @@ export function extractSeries(statements: any[]): PerformanceSeries {
             if (snapshotDate >= latestPositionDate) {
                 latestPositionDate = snapshotDate;
                 positions = asArray<any>(stmt.OpenPositions?.OpenPosition);
+                fxPositions = stmt.FxPositions === undefined ? undefined : asArray<any>(stmt.FxPositions?.FxPosition);
             }
             for (const row of asArray<any>(stmt.ConversionRates?.ConversionRate)) {
                 if (String(row.fromCurrency) !== 'USD') continue;
@@ -329,11 +346,16 @@ export function extractSeries(statements: any[]): PerformanceSeries {
         extracted.push({
             accountIds: [accountId], currency, fromDate: nav[0].date, toDate: nav[nav.length - 1].date,
             nav, flows: [...flowByDate].map(([date, amount]) => ({ date, amount })).sort((a, b) => a.date.localeCompare(b.date)),
-            fxToUsd, tax, fetchedAt: Date.now(), schemaVersion: CACHE_SCHEMA_VERSION, warnings: [],
+            fxToUsd, tax, ...(fxPositions ? { cashByCurrency: extractCashBalances(fxPositions, currency) } : {}),
+            ...(nonCashComplete ? { nonCashByDate } : {}),
+            fetchedAt: Date.now(), schemaVersion: CACHE_SCHEMA_VERSION, warnings: [],
         });
     }
-    const merged = extracted.length === 1 ? extracted[0] : {
-        ...extracted[0], ...mergeNavSeries(extracted), tax: {
+    const combined = extracted.length === 1 ? null : mergeNavSeries(extracted);
+    const merged = !combined ? extracted[0] : {
+        ...extracted[0], ...combined,
+        cashByCurrency: mergeCashBalances(extracted.map(s => s.cashByCurrency)),
+        nonCashByDate: sumByDate(extracted.map(s => s.nonCashByDate), combined.nav.map(n => n.date)), tax: {
             trades: extracted.flatMap(s => s.tax.trades), unrealized: extracted.flatMap(s => s.tax.unrealized),
             dividends: extracted.flatMap(s => s.tax.dividends), dividendWithheld: extracted.flatMap(s => s.tax.dividendWithheld),
             interest: extracted.flatMap(s => s.tax.interest), interestWithheld: extracted.flatMap(s => s.tax.interestWithheld),
@@ -455,6 +477,22 @@ export function extractUnrealizedPositions(positions: any[], currency: string, s
         }
     }
     return out;
+}
+
+/** Cash balances per currency from FxPositions SUMMARY rows; values are in base currency. */
+export function extractCashBalances(rows: any[], baseCurrency: string): CashBalance[] {
+    const summary = rows.filter(row => String(row.levelOfDetail ?? 'SUMMARY').toUpperCase() === 'SUMMARY');
+    const list = summary.map(row => {
+        if (row.functionalCurrency && String(row.functionalCurrency) !== baseCurrency) {
+            throw new Error('Hotovost ve FxPositions není oceněna v bázové měně účtu.');
+        }
+        return {
+            currency: String(row.fxCurrency ?? ''),
+            quantity: requiredNumber(row.quantity, 'hotovosti podle měn'),
+            value: requiredNumber(row.value, 'hodnotě hotovosti podle měn'),
+        };
+    }).filter(row => row.currency && (Math.abs(row.value) >= 1 || Math.abs(row.quantity) >= 1));
+    return mergeCashBalances([list])!;
 }
 
 function daysBetween(from: string, to: string): number {

@@ -36,6 +36,24 @@ export interface AnnualStrategyCost {
     flatTaxBroken: boolean;
     /** The chosen treatment of eligible foreign dividends, before any shared-prefix subtraction. */
     dividendTaxMode: 'progressive' | 'separate15' | null;
+    /** Whole-year components behind the costs, for display; not reduced by the shared prefix. */
+    detail: AnnualCostDetail;
+}
+
+export interface AnnualCostDetail {
+    /** Taxable gain per basket after exemptions; a negative basket is not taxed or offset. */
+    securitiesGain: number;
+    derivativesGain: number;
+    otherGain: number;
+    dividends: number;
+    interest: number;
+    /** Gross sale proceeds and income compared with the 50 000 CZK flat-tax limit. */
+    flatTaxIncome: number;
+    /** Normal-regime costs that replace the flat tax once it is lost. */
+    social: number;
+    health: number;
+    businessIncomeTax: number;
+    flatTaxPaid: number;
 }
 
 export interface AfterTaxComparisonResult {
@@ -73,8 +91,10 @@ export interface AfterTaxComparisonOptions {
 
 const INPUT_KEYS = ['trades', 'unrealized', 'dividends', 'dividendWithheld', 'interest', 'interestWithheld'] as const;
 const emptyInputs = (): TaxInputs => ({ trades: [], unrealized: [], dividends: [], dividendWithheld: [], interest: [], interestWithheld: [] });
+const emptyDetail = (): AnnualCostDetail => ({ securitiesGain: 0, derivativesGain: 0, otherGain: 0, dividends: 0,
+    interest: 0, flatTaxIncome: 0, social: 0, health: 0, businessIncomeTax: 0, flatTaxPaid: 0 });
 const emptyCost = (): AnnualStrategyCost => ({ investmentTax: 0, regimeCost: 0, totalCost: 0, withheld: 0,
-    foreignCredit: 0, investmentBase: 0, grossIncome: 0, flatTaxBroken: false, dividendTaxMode: null });
+    foreignCredit: 0, investmentBase: 0, grossIncome: 0, flatTaxBroken: false, dividendTaxMode: null, detail: emptyDetail() });
 
 function filterInputs(inputs: TaxInputs, predicate: (date: string) => boolean): TaxInputs {
     return {
@@ -217,6 +237,14 @@ export function computeAfterTaxComparison(opts: AfterTaxComparisonOptions): Afte
             : candidate(foreignIncomeMode);
         const investmentTax = selected.investmentTax;
         let regimeCost = 0;
+        const detail: AnnualCostDetail = {
+            ...emptyDetail(),
+            securitiesGain: combined.buckets.securities.gain,
+            derivativesGain: combined.buckets.derivatives.gain,
+            otherGain: combined.buckets.crypto.gain + combined.buckets.other.gain,
+            dividends: combined.dividends.gross, interest: combined.interest.gross,
+            flatTaxIncome: combined.grossIncome,
+        };
         if (settings.flatTaxRegime) {
             if (flatTaxBroken) {
                 const selfEmployed = computeSelfEmployed({
@@ -225,15 +253,18 @@ export function computeAfterTaxComparison(opts: AfterTaxComparisonOptions): Afte
                     actualExpenses: settings.actualExpenses, taxpayerCredit: settings.taxpayerCredit,
                     flatTaxPaid: settings.flatTaxMonthly * 12, year: Number(year),
                 }, 0, taxSettings);
-                regimeCost = selfEmployed.social + selfEmployed.health
-                    + Math.max(0, otherIncomeTax - settings.taxpayerCredit) - settings.flatTaxMonthly * 12;
+                detail.social = selfEmployed.social;
+                detail.health = selfEmployed.health;
+                detail.businessIncomeTax = Math.max(0, otherIncomeTax - settings.taxpayerCredit);
+                detail.flatTaxPaid = settings.flatTaxMonthly * 12;
+                regimeCost = detail.social + detail.health + detail.businessIncomeTax - detail.flatTaxPaid;
             }
         }
         return {
             investmentTax, regimeCost, totalCost: investmentTax + regimeCost,
             withheld: combined.dividends.withheld + combined.interest.withheld,
             foreignCredit: selected.foreignCredit, dividendTaxMode: selected.dividendTaxMode,
-            investmentBase: combined.investmentBase, grossIncome: combined.grossIncome, flatTaxBroken,
+            investmentBase: combined.investmentBase, grossIncome: combined.grossIncome, flatTaxBroken, detail,
         };
     };
 

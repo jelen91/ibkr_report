@@ -16,6 +16,9 @@
 
 export type TaxBucketKey = 'securities' | 'derivatives' | 'crypto' | 'other';
 
+/** Flex Trades exist only at other levels (Order, Closed Lot…); the tax inputs would silently be empty. */
+export const TRADES_WITHOUT_EXECUTION_WARNING = 'Sekce Trades neobsahuje jednotlivé obchody (úroveň Execution); odhad daně je bez realizovaných obchodů.';
+
 export interface RealizedTrade {
     date: string;            // YYYYMMDD, den obchodu
     assetCategory: string;   // STK / OPT / FUT / CASH / CRYPTO …
@@ -180,7 +183,7 @@ const BUCKET_OF: Record<string, TaxBucketKey> = {
     CRYPTO: 'crypto',
 };
 
-const bucketOf = (assetCategory: string): TaxBucketKey =>
+export const bucketOf = (assetCategory: string): TaxBucketKey =>
     BUCKET_OF[assetCategory?.toUpperCase()] ?? 'other';
 
 const emptyBucket = (): BucketResult => ({

@@ -1,15 +1,20 @@
 import { NextResponse, NextRequest } from 'next/server';
 import { isValidYmd } from '@/app/lib/twr';
+import { fillMissingCloses, lastIntradayCloses, parseDailyChart, ymdToEpoch } from '@/app/lib/benchmarkData';
 
 // Benchmark ve flex query není — IBKR reportuje jen to, co skutečně držíš.
 // Bere se tedy zvenčí. Volá se ze serveru, protože Yahoo neposílá CORS hlavičky.
 //
-// Používá se SPY (S&P 500 ETF) a jeho *adjusted close*, tedy total return
-// s reinvestovanými dividendami. Cenový index ^SPX by podstřeloval o ~1,3 % ročně
-// a srovnání by vycházelo falešně v tvůj prospěch.
+// Vrací zavírací ceny bez dividend (`prices`), dividendy podle ex-date a
+// Yahoo adjusted close (`closes`, hrubý total return). Osobní srovnání z cen
+// a dividend SPY skládá akumulační variantu s 15% srážkou: SPY se zavírá
+// v New Yorku ve stejnou chvíli, ke které IBKR oceňuje účet. Cenový index ^GSPC
+// by bez dividend podstřeloval o ~1,3 % ročně.
 
 const CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart';
 const CACHE_TTL_MS = 60 * 60 * 1000;
+// Doplněné nebo chybějící ceny se mohou ještě opravit; „obnovit později“ musí fungovat.
+const PROVISIONAL_TTL_MS = 5 * 60 * 1000;
 
 interface BenchmarkPayload {
     symbol: string;
@@ -19,17 +24,23 @@ interface BenchmarkPayload {
     closes: Record<string, number>;    // YYYYMMDD → adjusted close v USD (total return)
     prices: Record<string, number>;    // YYYYMMDD → cena bez dividend
     dividends: Record<string, number>; // YYYYMMDD → dividenda na akcii
+    /** Dny, kdy Yahoo nemělo denní close a použila se poslední hodinová cena. */
+    filledFromIntraday: string[];
+    /** Obchodní dny, pro které cena chybí i po doplnění z hodinových dat. */
+    missing: string[];
 }
 
-const cache = new Map<string, { at: number; data: BenchmarkPayload }>();
+const cache = new Map<string, { expires: number; data: BenchmarkPayload }>();
 
-const toYmd = (epochSeconds: number) => {
-    const d = new Date(epochSeconds * 1000);
-    return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-};
-
-const ymdToEpoch = (ymd: string) =>
-    Math.floor(Date.UTC(+ymd.slice(0, 4), +ymd.slice(4, 6) - 1, +ymd.slice(6, 8)) / 1000);
+async function fetchChart(symbol: string, period1: number, period2: number, interval: '1d' | '60m') {
+    const res = await fetch(
+        `${CHART_URL}/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=${interval}&events=div`,
+        { headers: { 'User-Agent': 'Mozilla/5.0' }, cache: 'no-store', signal: AbortSignal.timeout(20000) },
+    );
+    if (!res.ok) throw new Error(`Yahoo Finance vrátilo ${res.status}`);
+    const json = await res.json();
+    return json?.chart?.result?.[0];
+}
 
 export async function GET(request: NextRequest) {
     const symbol = request.nextUrl.searchParams.get('symbol') || 'SPY';
@@ -47,7 +58,7 @@ export async function GET(request: NextRequest) {
 
     const key = `${symbol}:${from}:${to}`;
     const hit = cache.get(key);
-    if (hit && Date.now() - hit.at < CACHE_TTL_MS) return NextResponse.json(hit.data);
+    if (hit && Date.now() < hit.expires) return NextResponse.json(hit.data);
 
     // Rezerva na obou koncích: první den portfolia může být svátek nebo víkend
     // a potřebujeme mít z čeho dopočítat cenu zpětně.
@@ -55,53 +66,36 @@ export async function GET(request: NextRequest) {
     const period2 = ymdToEpoch(to) + 3 * 86400;
 
     try {
-        const res = await fetch(
-            `${CHART_URL}/${encodeURIComponent(symbol)}?period1=${period1}&period2=${period2}&interval=1d&events=div`,
-            { headers: { 'User-Agent': 'Mozilla/5.0' }, cache: 'no-store', signal: AbortSignal.timeout(20000) },
-        );
-        if (!res.ok) throw new Error(`Yahoo Finance vrátilo ${res.status}`);
-
-        const json = await res.json();
-        const result = json?.chart?.result?.[0];
-        const timestamps: number[] | undefined = result?.timestamp;
-        const adj: (number | null)[] | undefined = result?.indicators?.adjclose?.[0]?.adjclose;
-        const close: (number | null)[] | undefined = result?.indicators?.quote?.[0]?.close;
-
-        if (!timestamps?.length || !adj?.length) throw new Error('Yahoo Finance nevrátilo použitelná data.');
+        const result = await fetchChart(symbol, period1, period2, '1d');
+        if (!result?.timestamp?.length || !result?.indicators?.adjclose?.[0]?.adjclose?.length) {
+            throw new Error('Yahoo Finance nevrátilo použitelná data.');
+        }
         if (result.meta?.currency !== 'USD') throw new Error('Benchmark není kotován v USD; přímé porovnání by míchalo měny.');
 
-        const closes: Record<string, number> = {};
-        const prices: Record<string, number> = {};
-        timestamps.forEach((t, i) => {
-            if (!Number.isFinite(t)) return;
-            const ymd = toYmd(t);
-            if (ymd > to) return;
-            // A daily bar for an open session is an intraday quote, not a close.
-            const regular = result.meta?.currentTradingPeriod?.regular;
-            if (regular && toYmd(regular.start) === ymd && Date.now() / 1000 < regular.end) return;
-            const a = adj[i];
-            const c = close?.[i];
-            if (typeof a === 'number' && Number.isFinite(a) && a > 0) closes[ymd] = a;
-            if (typeof c === 'number' && Number.isFinite(c) && c > 0) prices[ymd] = c;
-        });
-
-        // Jednotlivé dividendy jsou potřeba pro variantu "po zdanění": adjclose
-        // reinvestuje dividendy v hrubé výši, ale investor dostane jen čistou.
-        const dividends: Record<string, number> = {};
-        const divEvents = result?.events?.dividends ?? {};
-        for (const ev of Object.values<any>(divEvents)) {
-            if (Number.isFinite(ev?.amount) && Number.isFinite(ev?.date) && ev.amount >= 0) {
-                const ymd = toYmd(ev.date);
-                if (ymd > to) continue;
-                dividends[ymd] = (dividends[ymd] ?? 0) + ev.amount;
+        const daily = parseDailyChart(result, to);
+        let filledFromIntraday: string[] = [];
+        if (daily.missing.length) {
+            // Hodinová data drží Yahoo zhruba dva roky zpět, což pokrývá 365denní výpis.
+            try {
+                const first = ymdToEpoch(daily.missing[0]);
+                const last = ymdToEpoch(daily.missing.at(-1)!) + 86400;
+                const intraday = await fetchChart(symbol, first, last, '60m');
+                filledFromIntraday = fillMissingCloses(daily, lastIntradayCloses(intraday));
+            } catch (error) {
+                console.warn('Doplnění chybějících cen benchmarku selhalo:', error);
             }
         }
 
-        if (!Object.keys(closes).length || !Object.keys(closes).some(date => date >= from)) {
+        if (!Object.keys(daily.closes).length || !Object.keys(daily.closes).some(date => date >= from)) {
             throw new Error('Benchmark nemá platné závěrečné ceny ve zvoleném období.');
         }
-        const data: BenchmarkPayload = { symbol, from, to, currency: 'USD', closes, prices, dividends };
-        cache.set(key, { at: Date.now(), data });
+        const missing = daily.missing.filter(date => !filledFromIntraday.includes(date));
+        const data: BenchmarkPayload = {
+            symbol, from, to, currency: 'USD',
+            closes: daily.closes, prices: daily.prices, dividends: daily.dividends, filledFromIntraday, missing,
+        };
+        const provisional = missing.length > 0 || filledFromIntraday.length > 0;
+        cache.set(key, { expires: Date.now() + (provisional ? PROVISIONAL_TTL_MS : CACHE_TTL_MS), data });
         return NextResponse.json(data);
     } catch (error: any) {
         console.error('Benchmark API error:', error);

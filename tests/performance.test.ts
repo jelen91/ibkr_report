@@ -5,6 +5,7 @@ import {
     isValidYmd, mergeNavSeries, simulatePassive, simulatePassiveLedger,
 } from '../app/lib/twr';
 import { extractSeries } from '../app/lib/flexPerformance';
+import { TRADES_WITHOUT_EXECUTION_WARNING } from '../app/lib/tax';
 
 const close = (actual: number, expected: number) => assert.ok(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
 const nav = (values: number[], dates = ['20260102', '20260105', '20260106']) => values.map((value, i) => ({ date: dates[i], nav: value }));
@@ -112,4 +113,33 @@ test('passive ledger recognizes FIFO sale gains and dividend reinvestment basis 
     close(result.value, 8.5);
     close(result.trades.reduce((sum, t) => sum + t.pnl, 0), 10);
     assert.equal(result.trades.at(-1)!.acquiredDate, '20260105');
+});
+
+test('cash balances per currency come from FxPositions summaries in the base currency', () => {
+    const parsed = extractSeries([statement({ FxPositions: { FxPosition: [
+        { functionalCurrency: 'CZK', fxCurrency: 'EUR', quantity: '-10', value: '-250', levelOfDetail: 'SUMMARY' },
+        { functionalCurrency: 'CZK', fxCurrency: 'USD', quantity: '100', value: '2200', levelOfDetail: 'SUMMARY' },
+        { functionalCurrency: 'CZK', fxCurrency: 'USD', quantity: '100', value: '2200', levelOfDetail: 'LOT' },
+    ] } })]);
+    assert.deepEqual(parsed.cashByCurrency, [{ currency: 'USD', quantity: 100, value: 2200 }, { currency: 'EUR', quantity: -10, value: -250 }]);
+    assert.equal('cashByCurrency' in extractSeries([statement()]), false);
+    assert.throws(() => extractSeries([statement({ FxPositions: { FxPosition: { functionalCurrency: 'USD', fxCurrency: 'EUR', quantity: '1', value: '1' } } })]), /bázové/);
+});
+
+test('trades exported only at order level are reported instead of silently emptying the tax inputs', () => {
+    const order = { levelOfDetail: 'ORDER', tradeDate: '20260105', assetCategory: 'STK', currency: 'CZK', proceeds: '1000', fifoPnlRealized: '100', quantity: '-1', openCloseIndicator: 'C' };
+    const onlyOrders = extractSeries([statement({ Trades: { Order: order } })]);
+    assert.ok(onlyOrders.warnings.includes(TRADES_WITHOUT_EXECUTION_WARNING));
+    assert.equal(onlyOrders.tax.trades.length, 0);
+    const withExecution = extractSeries([statement({ Trades: { Trade: [{ ...order, levelOfDetail: 'EXECUTION' }, order] } })]);
+    assert.ok(!withExecution.warnings.includes(TRADES_WITHOUT_EXECUTION_WARNING));
+    assert.equal(withExecution.tax.trades.length, 1);
+    assert.ok(!extractSeries([statement()]).warnings.includes(TRADES_WITHOUT_EXECUTION_WARNING));
+});
+
+test('non-cash NAV per day is kept only when every NAV row has a cash column', () => {
+    const rows = nav([100, 110, 121]).map((n, i) => ({ reportDate: n.date, total: String(n.nav), cash: String(40 + i), interestAccruals: '1', currency: 'CZK' }));
+    const parsed = extractSeries([statement({ EquitySummaryInBase: { EquitySummaryByReportDateInBase: rows } })]);
+    assert.deepEqual(parsed.nonCashByDate, { '20260102': 59, '20260105': 68, '20260106': 78 });
+    assert.equal(extractSeries([statement()]).nonCashByDate, undefined);
 });
